@@ -2413,7 +2413,10 @@ impl ClusterInfo {
         for (address, request) in new_push_requests {
             if ContactInfo::is_valid_address(&address, &self.socket_addr_space) {
                 match Packet::from_data(Some(&address), &request) {
-                    Ok(packet) => packet_batch.push(packet),
+                    Ok(packet) => {
+                        // Only send prune packets
+                        //packet_batch.push(packet)
+                    }
                     Err(err) => error!("failed to write push-request packet: {:?}", err),
                 }
             } else {
@@ -2423,10 +2426,11 @@ impl ClusterInfo {
         self.stats
             .packets_sent_prune_messages_count
             .add_relaxed(num_prune_packets as u64);
-        self.stats
-            .packets_sent_push_messages_count
-            .add_relaxed((packet_batch.len() - num_prune_packets) as u64);
+        //self.stats
+            //.packets_sent_push_messages_count
+            //.add_relaxed((packet_batch.len() - num_prune_packets) as u64);
         if !packet_batch.is_empty() {
+            // Still send prune messages, those are important
             let _ = response_sender.send(packet_batch);
         }
     }
@@ -2515,7 +2519,7 @@ impl ClusterInfo {
             }
         };
         // Split packets based on their types.
-        let mut pull_requests = vec![];
+        //let mut pull_requests = vec![];
         let mut pull_responses = vec![];
         let mut push_messages = vec![];
         let mut prune_messages = vec![];
@@ -2524,9 +2528,10 @@ impl ClusterInfo {
         for (from_addr, packet) in packets {
             match packet {
                 Protocol::PullRequest(filter, caller) => {
-                    if verify_gossip_addr(&caller) {
+                    // Why process if we're ignoring them later
+                    /* if verify_gossip_addr(&caller) {
                         pull_requests.push((from_addr, filter, caller))
-                    }
+                    } */
                 }
                 Protocol::PullResponse(_, mut data) => {
                     check_duplicate_instance(&data)?;
@@ -2571,23 +2576,25 @@ impl ClusterInfo {
         }
         self.handle_batch_ping_messages(ping_messages, recycler, response_sender);
         self.handle_batch_prune_messages(prune_messages, stakes);
+        // Only push prune msgs out basically 
         self.handle_batch_push_messages(
             push_messages,
             thread_pool,
             recycler,
             stakes,
             response_sender,
-        );
+        ); 
         self.handle_batch_pull_responses(pull_responses, stakes, epoch_duration);
         self.trim_crds_table(CRDS_UNIQUE_PUBKEY_CAPACITY, stakes);
         self.handle_batch_pong_messages(pong_messages, Instant::now());
-        self.handle_batch_pull_requests(
+        // Don't bother sending any pull request responses - it only tells us about those without info
+        /* self.handle_batch_pull_requests(
             pull_requests,
             thread_pool,
             recycler,
             stakes,
             response_sender,
-        );
+        ); */
         Ok(())
     }
 
