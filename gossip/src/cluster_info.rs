@@ -2519,7 +2519,7 @@ impl ClusterInfo {
             }
         };
         // Split packets based on their types.
-        //let mut pull_requests = vec![];
+        let mut pull_requests = vec![];
         let mut pull_responses = vec![];
         let mut push_messages = vec![];
         let mut prune_messages = vec![];
@@ -2529,9 +2529,9 @@ impl ClusterInfo {
             match packet {
                 Protocol::PullRequest(filter, caller) => {
                     // Why process if we're ignoring them later
-                    /* if verify_gossip_addr(&caller) {
+                    if verify_gossip_addr(&caller) {
                         pull_requests.push((from_addr, filter, caller))
-                    } */
+                    } 
                 }
                 Protocol::PullResponse(_, mut data) => {
                     check_duplicate_instance(&data)?;
@@ -2587,14 +2587,14 @@ impl ClusterInfo {
         self.handle_batch_pull_responses(pull_responses, stakes, epoch_duration);
         self.trim_crds_table(CRDS_UNIQUE_PUBKEY_CAPACITY, stakes);
         self.handle_batch_pong_messages(pong_messages, Instant::now());
-        // Don't bother sending any pull request responses - it only tells us about those without info
-        /* self.handle_batch_pull_requests(
+        
+        self.handle_batch_pull_requests(
             pull_requests,
             thread_pool,
             recycler,
             stakes,
             response_sender,
-        ); */
+        ); 
         Ok(())
     }
 
