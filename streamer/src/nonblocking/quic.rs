@@ -1,4 +1,4 @@
-use ::{
+use {
     crate::{
         nonblocking::{
             connection_rate_limiter::{ ConnectionRateLimiter, TotalConnectionRateLimiter },
@@ -1468,7 +1468,7 @@ impl<'a> Future for EndpointAccept<'a> {
 
 #[cfg(test)]
 pub mod test {
-    use ::{
+    use {
         super::*,
         crate::{
             nonblocking::{
@@ -2384,27 +2384,25 @@ pub mod test {
         let client_connection = make_client_endpoint_0rtt(&server_address, None).await;
         assert!(client_connection.is_ok());
     }
-}
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_client_connection_close_invalid_stream() {
-    let SpawnTestServerResult { join_handle, server_address, stats, exit, .. } = setup_quic_server(
-        None,
-        TestServerConfig::default()
-    );
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_client_connection_close_invalid_stream() {
+        let SpawnTestServerResult { join_handle, server_address, stats, exit, .. } =
+            setup_quic_server(None, TestServerConfig::default());
 
-    let client_connection = make_client_endpoint(&server_address, None).await;
+        let client_connection = make_client_endpoint(&server_address, None).await;
 
-    let mut send_stream = client_connection.open_uni().await.unwrap();
-    send_stream.write_all(&[42; PACKET_DATA_SIZE + 1]).await.unwrap();
-    match client_connection.closed().await {
-        ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason }) => {
-            assert_eq!(error_code, CONNECTION_CLOSE_CODE_INVALID_STREAM.into());
-            assert_eq!(reason, CONNECTION_CLOSE_REASON_INVALID_STREAM);
+        let mut send_stream = client_connection.open_uni().await.unwrap();
+        send_stream.write_all(&[42; PACKET_DATA_SIZE + 1]).await.unwrap();
+        match client_connection.closed().await {
+            ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason }) => {
+                assert_eq!(error_code, CONNECTION_CLOSE_CODE_INVALID_STREAM.into());
+                assert_eq!(reason, CONNECTION_CLOSE_REASON_INVALID_STREAM);
+            }
+            _ => panic!("unexpected close"),
         }
-        _ => panic!("unexpected close"),
+        assert_eq!(stats.invalid_stream_size.load(Ordering::Relaxed), 1);
+        exit.store(true, Ordering::Relaxed);
+        join_handle.await.unwrap();
     }
-    assert_eq!(stats.invalid_stream_size.load(Ordering::Relaxed), 1);
-    exit.store(true, Ordering::Relaxed);
-    join_handle.await.unwrap();
 }

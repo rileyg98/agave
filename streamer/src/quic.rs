@@ -12,7 +12,7 @@ use {
         crypto::rustls::{NoInitialCipherSuite, QuicServerConfig},
         Endpoint, IdleTimeout, ServerConfig,
     },
-    rustls::KeyLogFile,
+    rustls::{server::ServerSessionMemoryCache, KeyLogFile},
     solana_keypair::Keypair,
     solana_packet::PACKET_DATA_SIZE,
     solana_perf::packet::PacketBatch,
