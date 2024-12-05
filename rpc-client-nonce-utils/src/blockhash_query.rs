@@ -114,7 +114,7 @@ mod tests {
         super::*,
         crate::blockhash_query,
         serde_json::{self, json},
-        solana_account_decoder::{UiAccount, UiAccountEncoding},
+        solana_account_decoder::{encode_ui_account, UiAccountEncoding},
         solana_rpc_client_api::{
             request::RpcRequest,
             response::{Response, RpcBlockhash, RpcResponseContext},
@@ -344,7 +344,7 @@ mod tests {
             .get_blockhash(&rpc_client, CommitmentConfig::default())
             .is_err());
 
-        let durable_nonce = DurableNonce::from_blockhash(&Hash::new(&[2u8; 32]));
+        let durable_nonce = DurableNonce::from_blockhash(&Hash::new_from_array([2u8; 32]));
         let nonce_blockhash = *durable_nonce.as_hash();
         let nonce_fee_calc = FeeCalculator::new(4242);
         let data = nonce::state::Data {
@@ -360,7 +360,7 @@ mod tests {
         )
         .unwrap();
         let nonce_pubkey = Pubkey::from([4u8; 32]);
-        let rpc_nonce_account = UiAccount::encode(
+        let rpc_nonce_account = encode_ui_account(
             &nonce_pubkey,
             &nonce_account,
             UiAccountEncoding::Base64,

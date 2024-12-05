@@ -44,6 +44,7 @@ rustls = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 serde_derive = { workspace = true }
+slab = { workspace = true }
 solana-accounts-db = { workspace = true }
 solana-bloom = { workspace = true }
 solana-builtins-default-costs = { workspace = true }
@@ -82,6 +83,7 @@ solana-streamer = { workspace = true }
 solana-svm = { workspace = true }
 solana-svm-transaction = { workspace = true }
 solana-timings = { workspace = true }
+solana-tls-utils = { workspace = true }
 solana-tpu-client = { workspace = true }
 solana-transaction-status = { workspace = true }
 solana-turbine = { workspace = true }
@@ -105,8 +107,10 @@ serde_json = { workspace = true }
 serial_test = { workspace = true }
 # See order-crates-for-publishing.py for using this unusual `path = "."`
 solana-core = { path = ".", features = ["dev-context-only-utils"] }
+solana-cost-model = { workspace = true, features = ["dev-context-only-utils"] }
 solana-ledger = { workspace = true, features = ["dev-context-only-utils"] }
 solana-logger = { workspace = true }
+solana-net-utils = { workspace = true, features = ["dev-context-only-utils"] }
 solana-poh = { workspace = true, features = ["dev-context-only-utils"] }
 solana-program-runtime = { workspace = true }
 solana-sdk = { workspace = true, features = ["dev-context-only-utils"] }
@@ -124,7 +128,9 @@ sysctl = { workspace = true }
 
 [features]
 dev-context-only-utils = [
+    "solana-perf/dev-context-only-utils",
     "solana-runtime/dev-context-only-utils",
+    "solana-streamer/dev-context-only-utils",
 ]
 frozen-abi = [
     "dep:solana-frozen-abi",

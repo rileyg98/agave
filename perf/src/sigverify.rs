@@ -11,14 +11,12 @@ use {
         recycler::Recycler,
     },
     rayon::{prelude::*, ThreadPool},
+    solana_hash::Hash,
+    solana_program::message::{MESSAGE_HEADER_LENGTH, MESSAGE_VERSION_PREFIX},
+    solana_pubkey::Pubkey,
     solana_rayon_threadlimit::get_thread_count,
-    solana_sdk::{
-        hash::Hash,
-        message::{MESSAGE_HEADER_LENGTH, MESSAGE_VERSION_PREFIX},
-        pubkey::Pubkey,
-        signature::Signature,
-    },
     solana_short_vec::decode_shortu16_len,
+    solana_signature::Signature,
     std::{convert::TryFrom, mem::size_of},
 };
 
@@ -417,7 +415,7 @@ fn check_for_simple_vote_transaction(
     if packet
         .data(instruction_program_id_start..instruction_program_id_end)
         .ok_or(PacketError::InvalidLen)?
-        == solana_sdk::vote::program::id().as_ref()
+        == solana_program::vote::program::id().as_ref()
     {
         packet.meta_mut().flags |= PacketFlags::SIMPLE_VOTE_TX;
     }
@@ -517,18 +515,11 @@ pub fn shrink_batches(batches: &mut Vec<PacketBatch>) {
 pub fn ed25519_verify_cpu(batches: &mut [PacketBatch], reject_non_vote: bool, packet_count: usize) {
     debug!("CPU ECDSA for {}", packet_count);
     PAR_THREAD_POOL.install(|| {
-        batches
-            .par_iter_mut()
-            .flatten()
-            .collect::<Vec<&mut Packet>>()
-            .par_chunks_mut(VERIFY_PACKET_CHUNK_SIZE)
-            .for_each(|packets| {
-                for packet in packets.iter_mut() {
-                    if !packet.meta().discard() && !verify_packet(packet, reject_non_vote) {
-                        packet.meta_mut().set_discard(true);
-                    }
-                }
-            });
+        batches.par_iter_mut().flatten().for_each(|packet| {
+            if !packet.meta().discard() && !verify_packet(packet, reject_non_vote) {
+                packet.meta_mut().set_discard(true);
+            }
+        });
     });
 }
 
@@ -684,12 +675,15 @@ mod tests {
         bincode::{deserialize, serialize},
         curve25519_dalek::{edwards::CompressedEdwardsY, scalar::Scalar},
         rand::{thread_rng, Rng},
-        solana_sdk::{
+        solana_program::{
             instruction::CompiledInstruction,
             message::{Message, MessageHeader},
-            signature::{Keypair, Signature, Signer},
+        },
+        solana_sdk::{
+            signature::{Keypair, Signer},
             transaction::Transaction,
         },
+        solana_signature::Signature,
         std::{
             iter::repeat_with,
             sync::atomic::{AtomicU64, Ordering},

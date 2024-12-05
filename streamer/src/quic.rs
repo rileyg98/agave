@@ -1,7 +1,10 @@
 use {
     crate::{
-        nonblocking::quic::ALPN_TPU_PROTOCOL_ID, streamer::StakedNodes,
-        tls_certificates::new_dummy_x509_certificate,
+        nonblocking::quic::{
+            ALPN_TPU_PROTOCOL_ID, DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE,
+            DEFAULT_MAX_STREAMS_PER_MS, DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
+        },
+        streamer::StakedNodes,
     },
     crossbeam_channel::Sender,
     pem::Pem,
@@ -9,15 +12,14 @@ use {
         crypto::rustls::{NoInitialCipherSuite, QuicServerConfig},
         Endpoint, IdleTimeout, ServerConfig,
     },
-    rustls::{
-        pki_types::{CertificateDer, UnixTime}, server::{danger::ClientCertVerified, ServerSessionMemoryCache}, DistinguishedName, KeyLogFile
-    },
+    rustls::KeyLogFile,
+    solana_keypair::Keypair,
+    solana_packet::PACKET_DATA_SIZE,
     solana_perf::packet::PacketBatch,
-    solana_sdk::{
-        packet::PACKET_DATA_SIZE,
-        quic::{NotifyKeyUpdate, QUIC_MAX_TIMEOUT, QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS},
-        signature::Keypair,
+    solana_quic_definitions::{
+        NotifyKeyUpdate, QUIC_MAX_TIMEOUT, QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS,
     },
+    solana_tls_utils::{new_dummy_x509_certificate, SkipClientVerification},
     std::{
         net::UdpSocket, sync::{
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -26,81 +28,22 @@ use {
     },
     tokio::runtime::Runtime,
 };
+//     rustls::{
+    //pki_types::{CertificateDer, UnixTime}, server::{danger::ClientCertVerified, ServerSessionMemoryCache}, DistinguishedName, KeyLogFile
+//},
 
 pub const MAX_STAKED_CONNECTIONS: usize = 2000;
 pub const MAX_UNSTAKED_CONNECTIONS: usize = 500;
 
 // This will be adjusted and parameterized in follow-on PRs.
 pub const DEFAULT_QUIC_ENDPOINTS: usize = 1;
-
-#[derive(Debug)]
-pub struct SkipClientVerification(Arc<rustls::crypto::CryptoProvider>);
-
-impl SkipClientVerification {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
-    }
-}
+// inlined to avoid solana-sdk dep
+pub(crate) const DEFAULT_TPU_COALESCE: Duration = Duration::from_millis(5);
 
 pub struct SpawnServerResult {
     pub endpoints: Vec<Endpoint>,
     pub thread: thread::JoinHandle<()>,
     pub key_updater: Arc<EndpointKeyUpdater>,
-}
-
-impl rustls::server::danger::ClientCertVerifier for SkipClientVerification {
-    fn verify_client_cert(
-        &self,
-        _end_entity: &CertificateDer,
-        _intermediates: &[CertificateDer],
-        _now: UnixTime,
-    ) -> Result<ClientCertVerified, rustls::Error> {
-        Ok(rustls::server::danger::ClientCertVerified::assertion())
-    }
-
-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &[]
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-
-    fn offer_client_auth(&self) -> bool {
-        true
-    }
-
-    fn client_auth_mandatory(&self) -> bool {
-        self.offer_client_auth()
-    }
 }
 
 /// Returns default server configuration along with its PEM certificate chain.
@@ -159,7 +102,7 @@ pub(crate) fn configure_server(
     Ok((server_config, cert_chain_pem))
 }
 
-fn rt(name: String) -> Runtime {
+pub fn rt(name: String) -> Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .thread_name(name)
         .enable_all()
@@ -197,8 +140,7 @@ pub struct StreamerStats {
     pub(crate) total_new_connections: AtomicUsize,
     pub(crate) total_streams: AtomicUsize,
     pub(crate) total_new_streams: AtomicUsize,
-    pub(crate) total_invalid_chunks: AtomicUsize,
-    pub(crate) total_invalid_chunk_size: AtomicUsize,
+    pub(crate) invalid_stream_size: AtomicUsize,
     pub(crate) total_packets_allocated: AtomicUsize,
     pub(crate) total_packet_batches_allocated: AtomicUsize,
     pub(crate) total_chunks_received: AtomicUsize,
@@ -404,13 +346,8 @@ impl StreamerStats {
                 i64
             ),
             (
-                "invalid_chunk",
-                self.total_invalid_chunks.swap(0, Ordering::Relaxed),
-                i64
-            ),
-            (
-                "invalid_chunk_size",
-                self.total_invalid_chunk_size.swap(0, Ordering::Relaxed),
+                "invalid_stream_size",
+                self.invalid_stream_size.swap(0, Ordering::Relaxed),
                 i64
             ),
             (
@@ -617,7 +554,6 @@ impl StreamerStats {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn spawn_server(
     thread_name: &'static str,
     metrics_name: &'static str,
@@ -625,14 +561,8 @@ pub fn spawn_server(
     keypair: &Keypair,
     packet_sender: Sender<PacketBatch>,
     exit: Arc<AtomicBool>,
-    max_connections_per_peer: usize,
     staked_nodes: Arc<RwLock<StakedNodes>>,
-    max_staked_connections: usize,
-    max_unstaked_connections: usize,
-    max_streams_per_ms: u64,
-    max_connections_per_ipaddr_per_min: u64,
-    wait_for_chunk_timeout: Duration,
-    coalesce: Duration,
+    quic_server_params: QuicServerParams,
 ) -> Result<SpawnServerResult, QuicServerError> {
     spawn_server_multi(
         thread_name,
@@ -641,18 +571,35 @@ pub fn spawn_server(
         keypair,
         packet_sender,
         exit,
-        max_connections_per_peer,
         staked_nodes,
-        max_staked_connections,
-        max_unstaked_connections,
-        max_streams_per_ms,
-        max_connections_per_ipaddr_per_min,
-        wait_for_chunk_timeout,
-        coalesce,
+        quic_server_params,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+pub struct QuicServerParams {
+    pub max_connections_per_peer: usize,
+    pub max_staked_connections: usize,
+    pub max_unstaked_connections: usize,
+    pub max_streams_per_ms: u64,
+    pub max_connections_per_ipaddr_per_min: u64,
+    pub wait_for_chunk_timeout: Duration,
+    pub coalesce: Duration,
+}
+
+impl Default for QuicServerParams {
+    fn default() -> Self {
+        QuicServerParams {
+            max_connections_per_peer: 1,
+            max_staked_connections: MAX_STAKED_CONNECTIONS,
+            max_unstaked_connections: MAX_UNSTAKED_CONNECTIONS,
+            max_streams_per_ms: DEFAULT_MAX_STREAMS_PER_MS,
+            max_connections_per_ipaddr_per_min: DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE,
+            wait_for_chunk_timeout: DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
+            coalesce: DEFAULT_TPU_COALESCE,
+        }
+    }
+}
+
 pub fn spawn_server_multi(
     thread_name: &'static str,
     metrics_name: &'static str,
@@ -660,14 +607,8 @@ pub fn spawn_server_multi(
     keypair: &Keypair,
     packet_sender: Sender<PacketBatch>,
     exit: Arc<AtomicBool>,
-    max_connections_per_peer: usize,
     staked_nodes: Arc<RwLock<StakedNodes>>,
-    max_staked_connections: usize,
-    max_unstaked_connections: usize,
-    max_streams_per_ms: u64,
-    max_connections_per_ipaddr_per_min: u64,
-    wait_for_chunk_timeout: Duration,
-    coalesce: Duration,
+    quic_server_params: QuicServerParams,
 ) -> Result<SpawnServerResult, QuicServerError> {
     let runtime = rt(format!("{thread_name}Rt"));
     let result = {
@@ -678,14 +619,8 @@ pub fn spawn_server_multi(
             keypair,
             packet_sender,
             exit,
-            max_connections_per_peer,
             staked_nodes,
-            max_staked_connections,
-            max_unstaked_connections,
-            max_streams_per_ms,
-            max_connections_per_ipaddr_per_min,
-            wait_for_chunk_timeout,
-            coalesce,
+            quic_server_params,
         )
     }?;
     let handle = thread::Builder::new()
@@ -709,14 +644,8 @@ pub fn spawn_server_multi(
 #[cfg(test)]
 mod test {
     use {
-        super::*,
-        crate::nonblocking::quic::{
-            test::*, DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE, DEFAULT_MAX_STREAMS_PER_MS,
-            DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
-        },
-        crossbeam_channel::unbounded,
-        solana_sdk::net::DEFAULT_TPU_COALESCE,
-        std::net::SocketAddr,
+        super::*, crate::nonblocking::quic::test::*, crossbeam_channel::unbounded,
+        solana_net_utils::bind_to_localhost, std::net::SocketAddr,
     };
 
     fn setup_quic_server() -> (
@@ -725,7 +654,7 @@ mod test {
         crossbeam_channel::Receiver<PacketBatch>,
         SocketAddr,
     ) {
-        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let s = bind_to_localhost().unwrap();
         let exit = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = unbounded();
         let keypair = Keypair::new();
@@ -742,14 +671,8 @@ mod test {
             &keypair,
             sender,
             exit.clone(),
-            1,
             staked_nodes,
-            MAX_STAKED_CONNECTIONS,
-            MAX_UNSTAKED_CONNECTIONS,
-            DEFAULT_MAX_STREAMS_PER_MS,
-            DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE,
-            DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
-            DEFAULT_TPU_COALESCE,
+            QuicServerParams::default(),
         )
         .unwrap();
         (t, exit, receiver, server_address)
@@ -786,7 +709,7 @@ mod test {
     #[test]
     fn test_quic_server_multiple_streams() {
         solana_logger::setup();
-        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let s = bind_to_localhost().unwrap();
         let exit = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = unbounded();
         let keypair = Keypair::new();
@@ -803,14 +726,11 @@ mod test {
             &keypair,
             sender,
             exit.clone(),
-            2,
             staked_nodes,
-            MAX_STAKED_CONNECTIONS,
-            MAX_UNSTAKED_CONNECTIONS,
-            DEFAULT_MAX_STREAMS_PER_MS,
-            DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE,
-            DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
-            DEFAULT_TPU_COALESCE,
+            QuicServerParams {
+                max_connections_per_peer: 2,
+                ..QuicServerParams::default()
+            },
         )
         .unwrap();
 
@@ -834,7 +754,7 @@ mod test {
     #[test]
     fn test_quic_server_unstaked_node_connect_failure() {
         solana_logger::setup();
-        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let s = bind_to_localhost().unwrap();
         let exit = Arc::new(AtomicBool::new(false));
         let (sender, _) = unbounded();
         let keypair = Keypair::new();
@@ -851,14 +771,11 @@ mod test {
             &keypair,
             sender,
             exit.clone(),
-            1,
             staked_nodes,
-            MAX_STAKED_CONNECTIONS,
-            0, // Do not allow any connection from unstaked clients/nodes
-            DEFAULT_MAX_STREAMS_PER_MS,
-            DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE,
-            DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
-            DEFAULT_TPU_COALESCE,
+            QuicServerParams {
+                max_unstaked_connections: 0,
+                ..QuicServerParams::default()
+            },
         )
         .unwrap();
 
@@ -866,5 +783,10 @@ mod test {
         runtime.block_on(check_unstaked_node_connect_failure(server_address));
         exit.store(true, Ordering::Relaxed);
         t.join().unwrap();
+    }
+
+    #[test]
+    fn test_inline_tpu_coalesce() {
+        assert_eq!(DEFAULT_TPU_COALESCE, solana_sdk::net::DEFAULT_TPU_COALESCE);
     }
 }

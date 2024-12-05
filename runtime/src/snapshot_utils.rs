@@ -1,6 +1,6 @@
 use {
     crate::{
-        bank::{BankFieldsToSerialize, BankSlotDelta},
+        bank::{BankFieldsToSerialize, BankHashStats, BankSlotDelta},
         serde_snapshot::{
             self, BankIncrementalSnapshotPersistence, ExtraFieldsToSerialize, SnapshotStreams,
         },
@@ -24,7 +24,7 @@ use {
     regex::Regex,
     solana_accounts_db::{
         account_storage::{meta::StoredMetaWriteVersion, AccountStorageMap},
-        accounts_db::{stats::BankHashStats, AccountStorageEntry, AtomicAccountsFileId},
+        accounts_db::{AccountStorageEntry, AtomicAccountsFileId},
         accounts_file::{AccountsFile, AccountsFileError, InternalsForArchive, StorageAccess},
         accounts_hash::{AccountsDeltaHash, AccountsHash},
         epoch_accounts_hash::EpochAccountsHash,
@@ -884,6 +884,7 @@ fn serialize_snapshot(
                 incremental_snapshot_persistence: bank_incremental_snapshot_persistence,
                 epoch_accounts_hash,
                 versioned_epoch_stakes,
+                accounts_lt_hash: bank_fields.accounts_lt_hash.clone().map(Into::into),
             };
             serde_snapshot::serialize_bank_snapshot_into(
                 stream,

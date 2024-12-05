@@ -51,6 +51,10 @@ use {
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
     },
+    transaction_scheduler::{
+        receive_and_buffer::SanitizedTransactionReceiveAndBuffer,
+        transaction_state_container::TransactionStateContainer,
+    },
 };
 
 // Below modules are pub to allow use by banking_stage bench
@@ -65,7 +69,6 @@ pub mod unprocessed_transaction_storage;
 mod consume_worker;
 mod decision_maker;
 mod forward_packet_batches_by_accounts;
-mod forward_worker;
 mod immutable_deserialized_packet;
 mod latest_unprocessed_votes;
 mod leader_slot_timing_metrics;
@@ -74,14 +77,13 @@ mod packet_deserializer;
 mod packet_filter;
 mod packet_receiver;
 mod read_write_account_set;
-#[allow(dead_code)]
 mod scheduler_messages;
 mod transaction_scheduler;
 
 // Fixed thread size seems to be fastest on GCP setup
 pub const NUM_THREADS: u32 = 6;
 
-const TOTAL_BUFFERED_PACKETS: usize = 700_000;
+const TOTAL_BUFFERED_PACKETS: usize = 100_000;
 
 const NUM_VOTE_PROCESSING_THREADS: u32 = 2;
 const MIN_THREADS_BANKING: u32 = 1;
@@ -399,22 +401,6 @@ impl BankingStage {
         enable_forwarding: bool,
     ) -> Self {
         match block_production_method {
-            BlockProductionMethod::ThreadLocalMultiIterator => {
-                Self::new_thread_local_multi_iterator(
-                    cluster_info,
-                    poh_recorder,
-                    non_vote_receiver,
-                    tpu_vote_receiver,
-                    gossip_vote_receiver,
-                    num_threads,
-                    transaction_status_sender,
-                    replay_vote_sender,
-                    log_messages_bytes_limit,
-                    connection_cache,
-                    bank_forks,
-                    prioritization_fee_cache,
-                )
-            }
             BlockProductionMethod::CentralScheduler => Self::new_central_scheduler(
                 cluster_info,
                 poh_recorder,
@@ -630,10 +616,15 @@ impl BankingStage {
         // Spawn the central scheduler thread
         bank_thread_hdls.push({
             let packet_deserializer = PacketDeserializer::new(non_vote_receiver);
+            let receive_and_buffer = SanitizedTransactionReceiveAndBuffer::new(
+                packet_deserializer,
+                bank_forks.clone(),
+                forwarder.is_some(),
+            );
             let scheduler = PrioGraphScheduler::new(work_senders, finished_work_receiver);
             let scheduler_controller = SchedulerController::new(
                 decision_maker.clone(),
-                packet_deserializer,
+                receive_and_buffer,
                 bank_forks,
                 scheduler,
                 worker_metrics,
@@ -843,6 +834,7 @@ mod tests {
             poh_service::PohService,
         },
         solana_runtime::{bank::Bank, genesis_utils::bootstrap_validator_stake_lamports},
+        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_sdk::{
             hash::Hash,
             poh_config::PohConfig,
@@ -869,9 +861,11 @@ mod tests {
         (node, cluster_info)
     }
 
-    pub(crate) fn sanitize_transactions(txs: Vec<Transaction>) -> Vec<SanitizedTransaction> {
+    pub(crate) fn sanitize_transactions(
+        txs: Vec<Transaction>,
+    ) -> Vec<RuntimeTransaction<SanitizedTransaction>> {
         txs.into_iter()
-            .map(SanitizedTransaction::from_transaction_for_tests)
+            .map(RuntimeTransaction::from_transaction_for_tests)
             .collect()
     }
 
@@ -897,7 +891,7 @@ mod tests {
             let (replay_vote_sender, _replay_vote_receiver) = unbounded();
 
             let banking_stage = BankingStage::new(
-                BlockProductionMethod::ThreadLocalMultiIterator,
+                BlockProductionMethod::CentralScheduler,
                 &cluster_info,
                 &poh_recorder,
                 non_vote_receiver,
@@ -953,7 +947,7 @@ mod tests {
             let (replay_vote_sender, _replay_vote_receiver) = unbounded();
 
             let banking_stage = BankingStage::new(
-                BlockProductionMethod::ThreadLocalMultiIterator,
+                BlockProductionMethod::CentralScheduler,
                 &cluster_info,
                 &poh_recorder,
                 non_vote_receiver,
@@ -1125,11 +1119,6 @@ mod tests {
             drop(entry_receiver);
         }
         Blockstore::destroy(ledger_path.path()).unwrap();
-    }
-
-    #[test]
-    fn test_banking_stage_entries_only_thread_local_multi_iterator() {
-        test_banking_stage_entries_only(BlockProductionMethod::ThreadLocalMultiIterator);
     }
 
     #[test]
@@ -1395,7 +1384,7 @@ mod tests {
             let (replay_vote_sender, _replay_vote_receiver) = unbounded();
 
             let banking_stage = BankingStage::new(
-                BlockProductionMethod::ThreadLocalMultiIterator,
+                BlockProductionMethod::CentralScheduler,
                 &cluster_info,
                 &poh_recorder,
                 non_vote_receiver,
@@ -1437,7 +1426,7 @@ mod tests {
                         &vote_keypairs[i],
                         &vote_keypairs[i],
                         None,
-                    );
+                    )
                 })
                 .collect_vec();
             let gossip_votes = (0..100_usize)
@@ -1454,7 +1443,7 @@ mod tests {
                         &vote_keypairs[i],
                         &vote_keypairs[i],
                         None,
-                    );
+                    )
                 })
                 .collect_vec();
             let txs = (0..100_usize)

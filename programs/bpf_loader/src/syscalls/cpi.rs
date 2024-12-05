@@ -137,6 +137,10 @@ impl<'a, 'b> CallerAccount<'a, 'b> {
                 invoke_context.get_check_aligned(),
             )?;
             if direct_mapping {
+                if account_info.lamports.as_ptr() as u64 >= ebpf::MM_INPUT_START {
+                    return Err(SyscallError::InvalidPointer.into());
+                }
+
                 check_account_info_pointer(
                     invoke_context,
                     *ptr,
@@ -154,6 +158,10 @@ impl<'a, 'b> CallerAccount<'a, 'b> {
         )?;
 
         let (serialized_data, vm_data_addr, ref_to_len_in_vm) = {
+            if direct_mapping && account_info.data.as_ptr() as u64 >= ebpf::MM_INPUT_START {
+                return Err(SyscallError::InvalidPointer.into());
+            }
+
             // Double translate data out of RefCell
             let data = *translate_type::<&[u8]>(
                 memory_mapping,
@@ -321,12 +329,6 @@ impl<'a, 'b> CallerAccount<'a, 'b> {
             .saturating_sub(account_info as *const _ as *const u64 as u64);
 
         let ref_to_len_in_vm = if direct_mapping {
-            // In the same vein as the other check_account_info_pointer() checks, we don't lock this
-            // pointer to a specific address but we don't want it to be inside accounts, or callees
-            // might be able to write to the pointed memory.
-            if data_len_vm_addr >= ebpf::MM_INPUT_START {
-                return Err(SyscallError::InvalidPointer.into());
-            }
             VmValue::VmAddress {
                 vm_addr: data_len_vm_addr,
                 memory_mapping,
@@ -645,11 +647,6 @@ impl SyscallInvokeSigned for SyscallInvokeSignedC {
             invoke_context.get_check_aligned(),
         )?;
 
-        check_instruction_size(
-            ix_c.accounts_len as usize,
-            ix_c.data_len as usize,
-            invoke_context,
-        )?;
         let program_id = translate_type::<Pubkey>(
             memory_mapping,
             ix_c.program_id_addr,
@@ -661,27 +658,27 @@ impl SyscallInvokeSigned for SyscallInvokeSignedC {
             ix_c.accounts_len,
             invoke_context.get_check_aligned(),
         )?;
+        let data = translate_slice::<u8>(
+            memory_mapping,
+            ix_c.data_addr,
+            ix_c.data_len,
+            invoke_context.get_check_aligned(),
+        )?
+        .to_vec();
 
-        let ix_data_len = ix_c.data_len;
+        check_instruction_size(ix_c.accounts_len as usize, data.len(), invoke_context)?;
+
         if invoke_context
             .get_feature_set()
             .is_active(&feature_set::loosen_cpi_size_restriction::id())
         {
             consume_compute_meter(
                 invoke_context,
-                (ix_data_len)
+                (data.len() as u64)
                     .checked_div(invoke_context.get_compute_budget().cpi_bytes_per_unit)
                     .unwrap_or(u64::MAX),
             )?;
         }
-
-        let data = translate_slice::<u8>(
-            memory_mapping,
-            ix_c.data_addr,
-            ix_data_len,
-            invoke_context.get_check_aligned(),
-        )?
-        .to_vec();
 
         let mut accounts = Vec::with_capacity(ix_c.accounts_len as usize);
         #[allow(clippy::needless_range_loop)]
@@ -804,6 +801,21 @@ fn translate_account_infos<'a, T, F>(
 where
     F: Fn(&T) -> u64,
 {
+    let direct_mapping = invoke_context
+        .get_feature_set()
+        .is_active(&feature_set::bpf_account_data_direct_mapping::id());
+
+    // In the same vein as the other check_account_info_pointer() checks, we don't lock
+    // this pointer to a specific address but we don't want it to be inside accounts, or
+    // callees might be able to write to the pointed memory.
+    if direct_mapping
+        && account_infos_addr
+            .saturating_add(account_infos_len.saturating_mul(std::mem::size_of::<T>() as u64))
+            >= ebpf::MM_INPUT_START
+    {
+        return Err(SyscallError::InvalidPointer.into());
+    }
+
     let account_infos = translate_slice::<T>(
         memory_mapping,
         account_infos_addr,
@@ -881,6 +893,7 @@ where
             .transaction_context
             .get_key_of_account_at_index(instruction_account.index_in_transaction)?;
 
+        #[allow(deprecated)]
         if callee_account.is_executable() {
             // Use the known account
             consume_compute_meter(

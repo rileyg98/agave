@@ -1,55 +1,17 @@
 use {
     crate::{
-        accounts_index::{AccountsIndexRootsStats, ZeroLamport},
+        accounts_index::AccountsIndexRootsStats,
         append_vec::{
             APPEND_VEC_MMAPPED_FILES_DIRTY, APPEND_VEC_MMAPPED_FILES_OPEN,
             APPEND_VEC_OPEN_AS_FILE_IO,
         },
     },
-    serde::{Deserialize, Serialize},
-    solana_sdk::{account::ReadableAccount, timing::AtomicInterval},
+    solana_sdk::timing::AtomicInterval,
     std::{
         num::Saturating,
         sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
-
-#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
-#[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BankHashStats {
-    pub num_updated_accounts: u64,
-    pub num_removed_accounts: u64,
-    pub num_lamports_stored: u64,
-    pub total_data_len: u64,
-    pub num_executable_accounts: u64,
-}
-
-impl BankHashStats {
-    pub fn update<T: ReadableAccount + ZeroLamport>(&mut self, account: &T) {
-        if account.is_zero_lamport() {
-            self.num_removed_accounts += 1;
-        } else {
-            self.num_updated_accounts += 1;
-        }
-        self.total_data_len = self
-            .total_data_len
-            .wrapping_add(account.data().len() as u64);
-        if account.executable() {
-            self.num_executable_accounts += 1;
-        }
-        self.num_lamports_stored = self.num_lamports_stored.wrapping_add(account.lamports());
-    }
-
-    pub fn accumulate(&mut self, other: &BankHashStats) {
-        self.num_updated_accounts += other.num_updated_accounts;
-        self.num_removed_accounts += other.num_removed_accounts;
-        self.total_data_len = self.total_data_len.wrapping_add(other.total_data_len);
-        self.num_lamports_stored = self
-            .num_lamports_stored
-            .wrapping_add(other.num_lamports_stored);
-        self.num_executable_accounts += other.num_executable_accounts;
-    }
-}
 
 #[derive(Debug, Default)]
 pub struct AccountsStats {
@@ -347,6 +309,8 @@ pub struct ShrinkAncientStats {
     pub slots_eligible_to_shrink: AtomicU64,
     pub total_dead_bytes: AtomicU64,
     pub total_alive_bytes: AtomicU64,
+    pub slot: AtomicU64,
+    pub ideal_storage_size: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -399,6 +363,10 @@ pub struct ShrinkStats {
     pub num_ancient_slots_shrunk: AtomicU64,
     pub ancient_slots_added_to_shrink: AtomicU64,
     pub ancient_bytes_added_to_shrink: AtomicU64,
+    pub num_dead_slots_added_to_clean: AtomicU64,
+    pub num_slots_with_zero_lamport_accounts_added_to_shrink: AtomicU64,
+    pub marking_zero_dead_accounts_in_non_shrinkable_store: AtomicU64,
+    pub num_zero_lamport_single_ref_accounts_found: AtomicU64,
 }
 
 impl ShrinkStats {
@@ -537,6 +505,30 @@ impl ShrinkStats {
                 (
                     "initial_candidates_count",
                     self.initial_candidates_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "num_dead_slots_added_to_clean",
+                    self.num_dead_slots_added_to_clean
+                        .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "num_slots_with_zero_lamport_accounts_added_to_shrink",
+                    self.num_slots_with_zero_lamport_accounts_added_to_shrink
+                        .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "marking_zero_dead_accounts_in_non_shrinkable_store",
+                    self.marking_zero_dead_accounts_in_non_shrinkable_store
+                        .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "num_zero_lamport_single_ref_accounts_found",
+                    self.num_zero_lamport_single_ref_accounts_found
+                        .swap(0, Ordering::Relaxed),
                     i64
                 ),
             );
@@ -770,6 +762,12 @@ impl ShrinkAncientStats {
                 self.shrink_stats
                     .accounts_not_found_in_index
                     .swap(0, Ordering::Relaxed),
+                i64
+            ),
+            ("slot", self.slot.load(Ordering::Relaxed), i64),
+            (
+                "ideal_storage_size",
+                self.ideal_storage_size.swap(0, Ordering::Relaxed),
                 i64
             ),
         );

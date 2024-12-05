@@ -15,6 +15,7 @@ use {
         commitment::BlockCommitmentCache,
         verify_precompiles::verify_precompiles,
     },
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_sdk::{
         account::Account,
         clock::Slot,
@@ -28,6 +29,7 @@ use {
     solana_send_transaction_service::{
         send_transaction_service::{SendTransactionService, TransactionInfo},
         tpu_info::NullTpuInfo,
+        transaction_client::ConnectionCacheClient,
     },
     std::{
         io,
@@ -178,7 +180,7 @@ fn simulate_transaction(
     bank: &Bank,
     transaction: VersionedTransaction,
 ) -> BanksTransactionResultWithSimulation {
-    let sanitized_transaction = match SanitizedTransaction::try_create(
+    let sanitized_transaction = match RuntimeTransaction::try_create(
         transaction,
         MessageHash::Compute,
         Some(false), // is_simple_vote_tx
@@ -453,16 +455,15 @@ pub async fn start_tcp_server(
         .map(move |chan| {
             let (sender, receiver) = unbounded();
 
-            SendTransactionService::new::<NullTpuInfo>(
+            let client = ConnectionCacheClient::<NullTpuInfo>::new(
+                connection_cache.clone(),
                 tpu_addr,
-                &bank_forks,
                 None,
-                receiver,
-                &connection_cache,
-                5_000,
+                None,
                 0,
-                exit.clone(),
             );
+
+            SendTransactionService::new(&bank_forks, receiver, client, 5_000, exit.clone());
 
             let server = BanksServer::new(
                 bank_forks.clone(),

@@ -61,6 +61,7 @@ jobs:
           cargo check
 
   test:
+    if: github.repository == 'anza-xyz/agave'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -123,6 +124,7 @@ jobs:
           done
 
   cargo-test-sbf:
+    if: github.repository == 'anza-xyz/agave'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -140,11 +142,9 @@ jobs:
           - [token-upgrade/program]
           - [feature-proposal/program]
           - [governance/addin-mock/program, governance/program]
-          - [memo/program]
           - [name-service/program]
           - [stake-pool/program]
           - [single-pool/program]
-
     steps:
       - uses: actions/checkout@v4
 

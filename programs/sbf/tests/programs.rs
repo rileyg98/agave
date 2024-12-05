@@ -17,8 +17,9 @@ use {
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_feature_set::{self as feature_set, FeatureSet},
     solana_ledger::token_balances::collect_token_balances,
-    solana_program_runtime::invoke_context::mock_process_instruction,
-    solana_rbpf::vm::ContextObject,
+    solana_program_runtime::{
+        invoke_context::mock_process_instruction, solana_rbpf::vm::ContextObject,
+    },
     solana_runtime::{
         bank::{Bank, TransactionBalancesSet},
         bank_client::BankClient,
@@ -33,7 +34,10 @@ use {
             load_upgradeable_program_wrapper, set_upgrade_authority, upgrade_program,
         },
     },
-    solana_runtime_transaction::instructions_processor::process_compute_budget_instructions,
+    solana_runtime_transaction::{
+        instructions_processor::process_compute_budget_instructions,
+        runtime_transaction::RuntimeTransaction,
+    },
     solana_sbf_rust_invoke_dep::*,
     solana_sbf_rust_realloc_dep::*,
     solana_sbf_rust_realloc_invoke_dep::*,
@@ -59,7 +63,7 @@ use {
         system_instruction::{self, MAX_PERMITTED_DATA_LENGTH},
         system_program,
         sysvar::{self, clock},
-        transaction::{SanitizedTransaction, Transaction, TransactionError, VersionedTransaction},
+        transaction::{Transaction, TransactionError, VersionedTransaction},
     },
     solana_svm::{
         transaction_commit_result::{CommittedTransaction, TransactionCommitResult},
@@ -652,7 +656,7 @@ fn test_return_data_and_log_data_syscall() {
         let blockhash = bank.last_blockhash();
         let message = Message::new(&[instruction], Some(&mint_keypair.pubkey()));
         let transaction = Transaction::new(&[&mint_keypair], message, blockhash);
-        let sanitized_tx = SanitizedTransaction::from_transaction_for_tests(transaction);
+        let sanitized_tx = RuntimeTransaction::from_transaction_for_tests(transaction);
 
         let result = bank.simulate_transaction(&sanitized_tx, false);
 
@@ -918,15 +922,15 @@ fn test_program_sbf_invoke_sanity() {
 
         do_invoke_failure_test_local(
             TEST_PPROGRAM_NOT_OWNED_BY_LOADER,
-            TransactionError::InstructionError(0, InstructionError::AccountNotExecutable),
-            &[],
+            TransactionError::InstructionError(0, InstructionError::UnsupportedProgramId),
+            &[argument_keypair.pubkey()],
             None,
         );
 
         do_invoke_failure_test_local(
             TEST_PPROGRAM_NOT_EXECUTABLE,
-            TransactionError::InstructionError(0, InstructionError::AccountNotExecutable),
-            &[],
+            TransactionError::InstructionError(0, InstructionError::UnsupportedProgramId),
+            &[unexecutable_program_keypair.pubkey()],
             None,
         );
 
@@ -1200,10 +1204,7 @@ fn test_program_sbf_caller_has_access_to_cpi_program() {
     ];
     let instruction = Instruction::new_with_bytes(caller_pubkey, &[1], account_metas.clone());
     let result = bank_client.send_and_confirm_instruction(&mint_keypair, instruction);
-    assert_eq!(
-        result.unwrap_err().unwrap(),
-        TransactionError::InstructionError(0, InstructionError::MissingAccount)
-    );
+    assert!(result.is_ok());
 }
 
 #[test]
@@ -1895,7 +1896,7 @@ fn test_program_sbf_invoke_in_same_tx_as_deployment() {
             let (result, _, _) = process_transaction_and_record_inner(&bank, tx);
             assert_eq!(
                 result.unwrap_err(),
-                TransactionError::InstructionError(2, InstructionError::InvalidAccountData),
+                TransactionError::InstructionError(2, InstructionError::UnsupportedProgramId),
             );
         }
     }
@@ -2006,7 +2007,7 @@ fn test_program_sbf_invoke_in_same_tx_as_redeployment() {
         let (result, _, _) = process_transaction_and_record_inner(&bank, tx);
         assert_eq!(
             result.unwrap_err(),
-            TransactionError::InstructionError(1, InstructionError::InvalidAccountData),
+            TransactionError::InstructionError(1, InstructionError::UnsupportedProgramId),
         );
     }
 }
@@ -2101,7 +2102,7 @@ fn test_program_sbf_invoke_in_same_tx_as_undeployment() {
         let (result, _, _) = process_transaction_and_record_inner(&bank, tx);
         assert_eq!(
             result.unwrap_err(),
-            TransactionError::InstructionError(1, InstructionError::InvalidAccountData),
+            TransactionError::InstructionError(1, InstructionError::UnsupportedProgramId),
         );
     }
 }
@@ -3856,6 +3857,7 @@ fn test_program_fees() {
         FeeStructure::new(0.000005, 0.0, vec![(200, 0.0000005), (1400000, 0.000005)]);
     bank.set_fee_structure(&fee_structure);
     let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
+    let feature_set = bank.feature_set.clone();
     let mut bank_client = BankClient::new_shared(bank);
     let authority_keypair = Keypair::new();
 
@@ -3879,9 +3881,10 @@ fn test_program_fees() {
     )
     .unwrap();
     let fee_budget_limits = FeeBudgetLimits::from(
-        process_compute_budget_instructions(SVMMessage::program_instructions_iter(
-            &sanitized_message,
-        ))
+        process_compute_budget_instructions(
+            SVMMessage::program_instructions_iter(&sanitized_message),
+            &feature_set,
+        )
         .unwrap_or_default(),
     );
     let expected_normal_fee = solana_fee::calculate_fee(
@@ -3911,9 +3914,10 @@ fn test_program_fees() {
     )
     .unwrap();
     let fee_budget_limits = FeeBudgetLimits::from(
-        process_compute_budget_instructions(SVMMessage::program_instructions_iter(
-            &sanitized_message,
-        ))
+        process_compute_budget_instructions(
+            SVMMessage::program_instructions_iter(&sanitized_message),
+            &feature_set,
+        )
         .unwrap_or_default(),
     );
     let expected_prioritized_fee = solana_fee::calculate_fee(
@@ -4650,7 +4654,7 @@ fn test_deny_executable_write() {
         let result = bank_client.send_and_confirm_instruction(&mint_keypair, instruction);
         assert_eq!(
             result.unwrap_err().unwrap(),
-            TransactionError::InstructionError(0, InstructionError::ExecutableDataModified)
+            TransactionError::InstructionError(0, InstructionError::ReadonlyDataModified)
         );
     }
 }
@@ -4925,6 +4929,170 @@ fn test_update_callee_account() {
 
                 assert_eq!(*v, expected, "offset:{i} {v:#x} != {expected:#x}");
             });
+        }
+    }
+}
+
+#[test]
+fn test_account_info_in_account() {
+    solana_logger::setup();
+
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(100_123_456_789);
+
+    let mut programs = Vec::new();
+    #[cfg(feature = "sbf_c")]
+    {
+        programs.push("invoke");
+    }
+    #[cfg(feature = "sbf_rust")]
+    {
+        programs.push("solana_sbf_rust_invoke");
+    }
+
+    for program in programs {
+        for direct_mapping in [false, true] {
+            let mut bank = Bank::new_for_tests(&genesis_config);
+            let feature_set = Arc::make_mut(&mut bank.feature_set);
+            // by default test banks have all features enabled, so we only need to
+            // disable when needed
+            if !direct_mapping {
+                feature_set.deactivate(&feature_set::bpf_account_data_direct_mapping::id());
+            }
+
+            let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
+            let mut bank_client = BankClient::new_shared(bank.clone());
+            let authority_keypair = Keypair::new();
+
+            let (bank, invoke_program_id) = load_upgradeable_program_and_advance_slot(
+                &mut bank_client,
+                bank_forks.as_ref(),
+                &mint_keypair,
+                &authority_keypair,
+                program,
+            );
+
+            let account_keypair = Keypair::new();
+
+            let mint_pubkey = mint_keypair.pubkey();
+
+            let account_metas = vec![
+                AccountMeta::new(mint_pubkey, true),
+                AccountMeta::new(account_keypair.pubkey(), false),
+                AccountMeta::new_readonly(invoke_program_id, false),
+            ];
+
+            let mut instruction_data = vec![TEST_ACCOUNT_INFO_IN_ACCOUNT];
+            instruction_data.extend_from_slice(32usize.to_le_bytes().as_ref());
+
+            let instruction =
+                Instruction::new_with_bytes(invoke_program_id, &instruction_data, account_metas);
+
+            let account = AccountSharedData::new(42, 10240, &invoke_program_id);
+
+            bank.store_account(&account_keypair.pubkey(), &account);
+
+            let result = bank_client.send_and_confirm_instruction(&mint_keypair, instruction);
+            if direct_mapping {
+                assert!(result.is_err());
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+}
+
+#[test]
+fn test_account_info_rc_in_account() {
+    solana_logger::setup();
+
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(100_123_456_789);
+
+    for direct_mapping in [false, true] {
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        let feature_set = Arc::make_mut(&mut bank.feature_set);
+        // by default test banks have all features enabled, so we only need to
+        // disable when needed
+        if !direct_mapping {
+            feature_set.deactivate(&feature_set::bpf_account_data_direct_mapping::id());
+        }
+
+        let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
+        let mut bank_client = BankClient::new_shared(bank.clone());
+        let authority_keypair = Keypair::new();
+
+        let (bank, invoke_program_id) = load_upgradeable_program_and_advance_slot(
+            &mut bank_client,
+            bank_forks.as_ref(),
+            &mint_keypair,
+            &authority_keypair,
+            "solana_sbf_rust_invoke",
+        );
+
+        let account_keypair = Keypair::new();
+
+        let mint_pubkey = mint_keypair.pubkey();
+
+        let account_metas = vec![
+            AccountMeta::new(mint_pubkey, true),
+            AccountMeta::new(account_keypair.pubkey(), false),
+            AccountMeta::new_readonly(invoke_program_id, false),
+        ];
+
+        let instruction_data = vec![TEST_ACCOUNT_INFO_LAMPORTS_RC, 0, 0, 0];
+
+        let instruction = Instruction::new_with_bytes(
+            invoke_program_id,
+            &instruction_data,
+            account_metas.clone(),
+        );
+
+        let account = AccountSharedData::new(42, 10240, &invoke_program_id);
+
+        bank.store_account(&account_keypair.pubkey(), &account);
+
+        let message = Message::new(&[instruction], Some(&mint_pubkey));
+        let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
+        let (result, _, logs) = process_transaction_and_record_inner(&bank, tx);
+
+        if direct_mapping {
+            assert!(
+                logs.last().unwrap().ends_with(" failed: Invalid pointer"),
+                "{logs:?}"
+            );
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok(), "{logs:?}");
+        }
+
+        let instruction_data = vec![TEST_ACCOUNT_INFO_DATA_RC, 0, 0, 0];
+
+        let instruction =
+            Instruction::new_with_bytes(invoke_program_id, &instruction_data, account_metas);
+
+        let account = AccountSharedData::new(42, 10240, &invoke_program_id);
+
+        bank.store_account(&account_keypair.pubkey(), &account);
+
+        let message = Message::new(&[instruction], Some(&mint_pubkey));
+        let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
+        let (result, _, logs) = process_transaction_and_record_inner(&bank, tx);
+
+        if direct_mapping {
+            assert!(
+                logs.last().unwrap().ends_with(" failed: Invalid pointer"),
+                "{logs:?}"
+            );
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok(), "{logs:?}");
         }
     }
 }
@@ -5275,4 +5443,66 @@ fn test_function_call_args() {
     );
     assert_eq!(decoded.many_args_1, verify_many_args(&input_data));
     assert_eq!(decoded.many_args_2, verify_many_args(&input_data));
+}
+
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_mem_syscalls_overlap_account_begin_or_end() {
+    solana_logger::setup();
+
+    for direct_mapping in [false, true] {
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(100_123_456_789);
+
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        let mut feature_set = FeatureSet::all_enabled();
+        if !direct_mapping {
+            feature_set.deactivate(&feature_set::bpf_account_data_direct_mapping::id());
+        }
+
+        let account_keypair = Keypair::new();
+
+        bank.feature_set = Arc::new(feature_set);
+        let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
+        let mut bank_client = BankClient::new_shared(bank);
+        let authority_keypair = Keypair::new();
+
+        let (bank, program_id) = load_upgradeable_program_and_advance_slot(
+            &mut bank_client,
+            bank_forks.as_ref(),
+            &mint_keypair,
+            &authority_keypair,
+            "solana_sbf_rust_account_mem",
+        );
+
+        let mint_pubkey = mint_keypair.pubkey();
+        let account_metas = vec![
+            AccountMeta::new(mint_pubkey, true),
+            AccountMeta::new_readonly(program_id, false),
+            AccountMeta::new(account_keypair.pubkey(), false),
+        ];
+
+        let account = AccountSharedData::new(42, 1024, &program_id);
+        bank.store_account(&account_keypair.pubkey(), &account);
+
+        for instr in 0..=13 {
+            println!("Testing direct_mapping:{direct_mapping} instruction:{instr}");
+            let instruction =
+                Instruction::new_with_bytes(program_id, &[instr], account_metas.clone());
+
+            let message = Message::new(&[instruction], Some(&mint_pubkey));
+            let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
+            let (result, _, logs) = process_transaction_and_record_inner(&bank, tx);
+
+            if direct_mapping {
+                assert!(logs.last().unwrap().ends_with(" failed: InvalidLength"));
+            } else if result.is_err() {
+                // without direct mapping, we should never get the InvalidLength error
+                assert!(!logs.last().unwrap().ends_with(" failed: InvalidLength"));
+            }
+        }
+    }
 }
