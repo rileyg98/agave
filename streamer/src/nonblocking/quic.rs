@@ -1474,11 +1474,11 @@ pub mod test {
             nonblocking::{
                 quic::compute_max_allowed_uni_streams,
                 testing_utilities::{
-                    get_client_config,
+                    check_multiple_streams, get_client_config,
                     make_client_endpoint,
                     make_client_endpoint_0rtt,
-                    setup_quic_server,
-                    SpawnTestServerResult,
+                   
+                    setup_quic_server, SpawnTestServerResult,
                     TestServerConfig,
                 },
             },
@@ -1961,7 +1961,7 @@ pub mod test {
             }
         ).unwrap();
 
-        check_multiple_streams(receiver, server_address).await;
+        check_multiple_streams(receiver, server_address, None).await;
         assert_eq!(stats.total_streams.load(Ordering::Relaxed), 0);
         assert_eq!(stats.total_new_streams.load(Ordering::Relaxed), 20);
         assert_eq!(stats.total_connections.load(Ordering::Relaxed), 2);

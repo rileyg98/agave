@@ -6,7 +6,6 @@ use {
         accounts_hash_verifier::AccountsHashVerifier,
         admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
         banking_trace::{self, BankingTracer, TraceError},
-        cache_block_meta_service::{CacheBlockMetaSender, CacheBlockMetaService},
         cluster_info_vote_listener::VoteTracker,
         completed_data_sets_service::CompletedDataSetsService,
         consensus::{
@@ -21,7 +20,6 @@ use {
             serve_repair::ServeRepair,
             serve_repair_service::ServeRepairService,
         },
-        rewards_recorder_service::RewardsRecorderService,
         sample_performance_service::SamplePerformanceService,
         sigverify,
         snapshot_packager_service::{PendingSnapshotPackages, SnapshotPackagerService},
@@ -66,7 +64,7 @@ use {
         },
         blockstore_metric_report_service::BlockstoreMetricReportService,
         blockstore_options::{BlockstoreOptions, BLOCKSTORE_DIRECTORY_ROCKS_LEVEL},
-        blockstore_processor::{self, RewardsRecorderSender, TransactionStatusSender},
+        blockstore_processor::{self, TransactionStatusSender},
         entry_notifier_interface::EntryNotifierArc,
         entry_notifier_service::{EntryNotifierSender, EntryNotifierService},
         leader_schedule::FixedSchedule,
@@ -83,6 +81,7 @@ use {
     },
     solana_rayon_threadlimit::{get_max_thread_count, get_thread_count},
     solana_rpc::{
+        cache_block_meta_service::{CacheBlockMetaSender, CacheBlockMetaService},
         max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::{
             BankNotificationSenderConfig, OptimisticallyConfirmedBank,
@@ -469,11 +468,23 @@ struct TransactionHistoryServices {
     transaction_status_sender: Option<TransactionStatusSender>,
     transaction_status_service: Option<TransactionStatusService>,
     max_complete_transaction_status_slot: Arc<AtomicU64>,
-    rewards_recorder_sender: Option<RewardsRecorderSender>,
-    rewards_recorder_service: Option<RewardsRecorderService>,
     max_complete_rewards_slot: Arc<AtomicU64>,
     cache_block_meta_sender: Option<CacheBlockMetaSender>,
     cache_block_meta_service: Option<CacheBlockMetaService>,
+}
+
+/// A struct easing passing Validator TPU Configurations
+pub struct ValidatorTpuConfig {
+    /// Controls if to use QUIC for sending regular TPU transaction
+    pub use_quic: bool,
+    /// Controls if to use QUIC for sending TPU votes
+    pub vote_use_quic: bool,
+    /// Controls the connection cache pool size
+    pub tpu_connection_pool_size: usize,
+    /// Controls if to enable UDP for TPU tansactions.
+    pub tpu_enable_udp: bool,
+    /// Controls the new maximum connections per IpAddr per minute
+    pub tpu_max_connections_per_ipaddr_per_minute: u64,
 }
 
 pub struct Validator {
@@ -483,7 +494,6 @@ pub struct Validator {
     rpc_completed_slots_service: Option<JoinHandle<()>>,
     optimistically_confirmed_bank_tracker: Option<OptimisticallyConfirmedBankTracker>,
     transaction_status_service: Option<TransactionStatusService>,
-    rewards_recorder_service: Option<RewardsRecorderService>,
     cache_block_meta_service: Option<CacheBlockMetaService>,
     entry_notifier_service: Option<EntryNotifierService>,
     system_monitor_service: Option<SystemMonitorService>,
@@ -528,12 +538,17 @@ impl Validator {
         rpc_to_plugin_manager_receiver: Option<Receiver<GeyserPluginManagerRequest>>,
         start_progress: Arc<RwLock<ValidatorStartProgress>>,
         socket_addr_space: SocketAddrSpace,
-        use_quic: bool,
-        tpu_connection_pool_size: usize,
-        tpu_enable_udp: bool,
-        tpu_max_connections_per_ipaddr_per_minute: u64,
+        tpu_config: ValidatorTpuConfig,
         admin_rpc_service_post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
     ) -> Result<Self> {
+        let ValidatorTpuConfig {
+            use_quic,
+            vote_use_quic,
+            tpu_connection_pool_size,
+            tpu_enable_udp,
+            tpu_max_connections_per_ipaddr_per_minute,
+        } = tpu_config;
+
         let start_time = Instant::now();
 
         // Initialize the global rayon pool first to ensure the value in config
@@ -726,8 +741,6 @@ impl Validator {
                 transaction_status_sender,
                 transaction_status_service,
                 max_complete_transaction_status_slot,
-                rewards_recorder_sender,
-                rewards_recorder_service,
                 max_complete_rewards_slot,
                 cache_block_meta_sender,
                 cache_block_meta_service,
@@ -906,7 +919,6 @@ impl Validator {
             &blockstore_process_options,
             transaction_status_sender.as_ref(),
             cache_block_meta_sender.clone(),
-            rewards_recorder_sender.as_ref(),
             entry_notification_sender,
             blockstore_root_scan,
             accounts_background_request_sender.clone(),
@@ -990,29 +1002,52 @@ impl Validator {
 
         let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
 
-        let connection_cache = match use_quic {
-            true => {
-                let connection_cache = ConnectionCache::new_with_client_options(
-                    "connection_cache_tpu_quic",
-                    tpu_connection_pool_size,
-                    None,
-                    Some((
-                        &identity_keypair,
-                        node.info
-                            .tpu(Protocol::UDP)
-                            .map_err(|err| {
-                                ValidatorError::Other(format!("Invalid TPU address: {err:?}"))
-                            })?
-                            .ip(),
-                    )),
-                    Some((&staked_nodes, &identity_keypair.pubkey())),
-                );
-                Arc::new(connection_cache)
-            }
-            false => Arc::new(ConnectionCache::with_udp(
+        let connection_cache = if use_quic {
+            let connection_cache = ConnectionCache::new_with_client_options(
+                "connection_cache_tpu_quic",
+                tpu_connection_pool_size,
+                None,
+                Some((
+                    &identity_keypair,
+                    node.info
+                        .tpu(Protocol::UDP)
+                        .map_err(|err| {
+                            ValidatorError::Other(format!("Invalid TPU address: {err:?}"))
+                        })?
+                        .ip(),
+                )),
+                Some((&staked_nodes, &identity_keypair.pubkey())),
+            );
+            Arc::new(connection_cache)
+        } else {
+            Arc::new(ConnectionCache::with_udp(
                 "connection_cache_tpu_udp",
                 tpu_connection_pool_size,
-            )),
+            ))
+        };
+
+        let vote_connection_cache = if vote_use_quic {
+            let vote_connection_cache = ConnectionCache::new_with_client_options(
+                "connection_cache_vote_quic",
+                tpu_connection_pool_size,
+                None, // client_endpoint
+                Some((
+                    &identity_keypair,
+                    node.info
+                        .tpu_vote(Protocol::QUIC)
+                        .map_err(|err| {
+                            ValidatorError::Other(format!("Invalid TPU Vote address: {err:?}"))
+                        })?
+                        .ip(),
+                )),
+                Some((&staked_nodes, &identity_keypair.pubkey())),
+            );
+            Arc::new(vote_connection_cache)
+        } else {
+            Arc::new(ConnectionCache::with_udp(
+                "connection_cache_vote_udp",
+                tpu_connection_pool_size,
+            ))
         };
 
         let rpc_override_health_check =
@@ -1389,7 +1424,6 @@ impl Validator {
             block_commitment_cache,
             config.turbine_disabled.clone(),
             transaction_status_sender.clone(),
-            rewards_recorder_sender,
             cache_block_meta_sender,
             entry_notification_sender.clone(),
             vote_tracker.clone(),
@@ -1428,6 +1462,7 @@ impl Validator {
             cluster_slots.clone(),
             wen_restart_repair_slots.clone(),
             slot_status_notifier,
+            vote_connection_cache,
         )
         .map_err(ValidatorError::Other)?;
 
@@ -1530,7 +1565,6 @@ impl Validator {
             rpc_completed_slots_service,
             optimistically_confirmed_bank_tracker,
             transaction_status_service,
-            rewards_recorder_service,
             cache_block_meta_service,
             entry_notifier_service,
             system_monitor_service,
@@ -1631,12 +1665,6 @@ impl Validator {
             transaction_status_service
                 .join()
                 .expect("transaction_status_service");
-        }
-
-        if let Some(rewards_recorder_service) = self.rewards_recorder_service {
-            rewards_recorder_service
-                .join()
-                .expect("rewards_recorder_service");
         }
 
         if let Some(cache_block_meta_service) = self.cache_block_meta_service {
@@ -2026,7 +2054,6 @@ pub struct ProcessBlockStore<'a> {
     process_options: &'a blockstore_processor::ProcessOptions,
     transaction_status_sender: Option<&'a TransactionStatusSender>,
     cache_block_meta_sender: Option<CacheBlockMetaSender>,
-    rewards_recorder_sender: Option<&'a RewardsRecorderSender>,
     entry_notification_sender: Option<&'a EntryNotifierSender>,
     blockstore_root_scan: Option<BlockstoreRootScan>,
     accounts_background_request_sender: AbsRequestSender,
@@ -2047,7 +2074,6 @@ impl<'a> ProcessBlockStore<'a> {
         process_options: &'a blockstore_processor::ProcessOptions,
         transaction_status_sender: Option<&'a TransactionStatusSender>,
         cache_block_meta_sender: Option<CacheBlockMetaSender>,
-        rewards_recorder_sender: Option<&'a RewardsRecorderSender>,
         entry_notification_sender: Option<&'a EntryNotifierSender>,
         blockstore_root_scan: BlockstoreRootScan,
         accounts_background_request_sender: AbsRequestSender,
@@ -2064,7 +2090,6 @@ impl<'a> ProcessBlockStore<'a> {
             process_options,
             transaction_status_sender,
             cache_block_meta_sender,
-            rewards_recorder_sender,
             entry_notification_sender,
             blockstore_root_scan: Some(blockstore_root_scan),
             accounts_background_request_sender,
@@ -2103,7 +2128,6 @@ impl<'a> ProcessBlockStore<'a> {
                 self.process_options,
                 self.transaction_status_sender,
                 self.cache_block_meta_sender.as_ref(),
-                self.rewards_recorder_sender,
                 self.entry_notification_sender,
                 &self.accounts_background_request_sender,
             )
@@ -2413,28 +2437,18 @@ fn initialize_rpc_transaction_history_services(
     ));
 
     let max_complete_rewards_slot = Arc::new(AtomicU64::new(blockstore.max_root()));
-    let (rewards_recorder_sender, rewards_receiver) = unbounded();
-    let rewards_recorder_sender = Some(rewards_recorder_sender.into());
-    let rewards_recorder_service = Some(RewardsRecorderService::new(
-        rewards_receiver,
-        max_complete_rewards_slot.clone(),
-        blockstore.clone(),
-        exit.clone(),
-    ));
-
     let (cache_block_meta_sender, cache_block_meta_receiver) = unbounded();
     let cache_block_meta_sender = Some(cache_block_meta_sender);
     let cache_block_meta_service = Some(CacheBlockMetaService::new(
         cache_block_meta_receiver,
         blockstore,
+        max_complete_rewards_slot.clone(),
         exit,
     ));
     TransactionHistoryServices {
         transaction_status_sender,
         transaction_status_service,
         max_complete_transaction_status_slot,
-        rewards_recorder_sender,
-        rewards_recorder_service,
         max_complete_rewards_slot,
         cache_block_meta_sender,
         cache_block_meta_service,
@@ -2466,7 +2480,7 @@ pub enum ValidatorError {
     )]
     PohTooSlow { mine: u64, target: u64 },
 
-    #[error("shred version mistmatch: actual {actual}, expected {expected}")]
+    #[error("shred version mismatch: actual {actual}, expected {expected}")]
     ShredVersionMismatch { actual: u16, expected: u16 },
 
     #[error(transparent)]
@@ -2715,6 +2729,7 @@ mod tests {
         solana_sdk::{genesis_config::create_genesis_config, poh_config::PohConfig},
         solana_tpu_client::tpu_client::{
             DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_TPU_ENABLE_UDP, DEFAULT_TPU_USE_QUIC,
+            DEFAULT_VOTE_USE_QUIC,
         },
         std::{fs::remove_dir_all, thread, time::Duration},
     };
@@ -2753,10 +2768,13 @@ mod tests {
             None, // rpc_to_plugin_manager_receiver
             start_progress.clone(),
             SocketAddrSpace::Unspecified,
-            DEFAULT_TPU_USE_QUIC,
-            DEFAULT_TPU_CONNECTION_POOL_SIZE,
-            DEFAULT_TPU_ENABLE_UDP,
-            32, // max connections per IpAddr per minute for test
+            ValidatorTpuConfig {
+                use_quic: DEFAULT_TPU_USE_QUIC,
+                vote_use_quic: DEFAULT_VOTE_USE_QUIC,
+                tpu_connection_pool_size: DEFAULT_TPU_CONNECTION_POOL_SIZE,
+                tpu_enable_udp: DEFAULT_TPU_ENABLE_UDP,
+                tpu_max_connections_per_ipaddr_per_minute: 32, // max connections per IpAddr per minute for test
+            },
             Arc::new(RwLock::new(None)),
         )
         .expect("assume successful validator start");
@@ -2972,10 +2990,13 @@ mod tests {
                     None, // rpc_to_plugin_manager_receiver
                     Arc::new(RwLock::new(ValidatorStartProgress::default())),
                     SocketAddrSpace::Unspecified,
-                    DEFAULT_TPU_USE_QUIC,
-                    DEFAULT_TPU_CONNECTION_POOL_SIZE,
-                    DEFAULT_TPU_ENABLE_UDP,
-                    32, // max connections per IpAddr per minute for test
+                    ValidatorTpuConfig {
+                        use_quic: DEFAULT_TPU_USE_QUIC,
+                        vote_use_quic: DEFAULT_VOTE_USE_QUIC,
+                        tpu_connection_pool_size: DEFAULT_TPU_CONNECTION_POOL_SIZE,
+                        tpu_enable_udp: DEFAULT_TPU_ENABLE_UDP,
+                        tpu_max_connections_per_ipaddr_per_minute: 32, // max connections per IpAddr per minute for test
+                    },
                     Arc::new(RwLock::new(None)),
                 )
                 .expect("assume successful validator start")

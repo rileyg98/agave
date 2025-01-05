@@ -12,8 +12,8 @@
 //! RuntimeTransaction types, not the TransactionMeta itself.
 //!
 use {
-    crate::compute_budget_instruction_details::ComputeBudgetInstructionDetails,
-    solana_sdk::{hash::Hash, message::TransactionSignatureDetails},
+    solana_compute_budget_instruction::compute_budget_instruction_details::ComputeBudgetInstructionDetails,
+    solana_hash::Hash, solana_message::TransactionSignatureDetails,
 };
 
 /// metadata can be extracted statically from sanitized transaction,

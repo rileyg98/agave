@@ -222,7 +222,9 @@ fn test_local_cluster_signature_subscribe() {
         .unwrap();
     let non_bootstrap_info = cluster.get_contact_info(&non_bootstrap_id).unwrap();
 
-    let tx_client = cluster.build_tpu_quic_client().unwrap();
+    let tx_client = cluster
+        .build_validator_tpu_quic_client(cluster.entry_point_info.pubkey())
+        .unwrap();
 
     let (blockhash, _) = tx_client
         .rpc_client()
@@ -431,7 +433,9 @@ fn test_mainnet_beta_cluster_type() {
     .unwrap();
     assert_eq!(cluster_nodes.len(), 1);
 
-    let client = cluster.build_tpu_quic_client().unwrap();
+    let client = cluster
+        .build_validator_tpu_quic_client(cluster.entry_point_info.pubkey())
+        .unwrap();
 
     // Programs that are available at epoch 0
     for program_id in [
@@ -1002,7 +1006,7 @@ fn test_incremental_snapshot_download_with_crossing_full_snapshot_interval_at_st
     let timer = Instant::now();
     loop {
         let validator_current_slot = cluster
-            .get_validator_client(&validator_identity.pubkey())
+            .build_validator_tpu_quic_client(&validator_identity.pubkey())
             .unwrap()
             .rpc_client()
             .get_slot_with_commitment(CommitmentConfig::finalized())
@@ -1377,7 +1381,9 @@ fn test_snapshots_blockstore_floor() {
         .into_iter()
         .find(|x| x != cluster.entry_point_info.pubkey())
         .unwrap();
-    let validator_client = cluster.get_validator_client(&validator_id).unwrap();
+    let validator_client = cluster
+        .build_validator_tpu_quic_client(&validator_id)
+        .unwrap();
     let mut current_slot = 0;
 
     // Let this validator run a while with repair
@@ -1611,7 +1617,7 @@ fn test_no_voting() {
     };
     let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
     let client = cluster
-        .get_validator_client(cluster.entry_point_info.pubkey())
+        .build_validator_tpu_quic_client(cluster.entry_point_info.pubkey())
         .unwrap();
     loop {
         let last_slot = client
@@ -1675,78 +1681,170 @@ fn test_optimistic_confirmation_violation_detection() {
     // so that the vote on `S-1` is definitely in gossip and optimistic confirmation is
     // detected on slot `S-1` for sure, then stop the heavier of the two
     // validators
-    let client = cluster.get_validator_client(&node_to_restart).unwrap();
-    let mut prev_voted_slot = 0;
+    let client = cluster
+        .build_validator_tpu_quic_client(&node_to_restart)
+        .unwrap();
+    let start = Instant::now();
+    let target_slot = 50;
+    let max_wait_time_seconds = 100;
+    let mut optimistically_confirmed_slot;
     loop {
-        let last_voted_slot = client
+        optimistically_confirmed_slot = client
             .rpc_client()
-            .get_slot_with_commitment(CommitmentConfig::processed())
+            .get_slot_with_commitment(CommitmentConfig::confirmed())
             .unwrap();
-        if last_voted_slot > 50 {
-            if prev_voted_slot == 0 {
-                prev_voted_slot = last_voted_slot;
-            } else {
-                break;
-            }
+
+        if optimistically_confirmed_slot > target_slot {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(max_wait_time_seconds) {
+            cluster.exit();
+            panic!("Didn't get optimistcally confirmed slot > {target_slot} within {max_wait_time_seconds} seconds");
         }
         sleep(Duration::from_millis(100));
     }
 
-    let exited_validator_info = cluster.exit_node(&node_to_restart);
+    info!("exiting node");
+    drop(client);
+    let mut exited_validator_info = cluster.exit_node(&node_to_restart);
+    info!("exiting node success");
 
     // Mark fork as dead on the heavier validator, this should make the fork effectively
     // dead, even though it was optimistically confirmed. The smaller validator should
     // create and jump over to a new fork
     // Also, remove saved tower to intentionally make the restarted validator to violate the
     // optimistic confirmation
-    {
+    let optimistically_confirmed_slot_parent = {
+        let tower = restore_tower(
+            &exited_validator_info.info.ledger_path,
+            &exited_validator_info.info.keypair.pubkey(),
+        )
+        .unwrap();
+
+        // Vote must exist since we waited for OC and so this node must have voted
+        let last_voted_slot = tower.last_voted_slot().expect("vote must exist");
         let blockstore = open_blockstore(&exited_validator_info.info.ledger_path);
+
+        // The last vote must be descended from the OC slot
+        assert!(
+            AncestorIterator::new_inclusive(last_voted_slot, &blockstore)
+                .contains(&optimistically_confirmed_slot)
+        );
+
         info!(
-            "Setting slot: {} on main fork as dead, should cause fork",
-            prev_voted_slot
+            "Setting slot: {optimistically_confirmed_slot} on main fork as dead, should cause fork"
         );
         // Necessary otherwise tower will inform this validator that it's latest
-        // vote is on slot `prev_voted_slot`. This will then prevent this validator
-        // from resetting to the parent of `prev_voted_slot` to create an alternative fork because
+        // vote is on slot `optimistically_confirmed_slot`. This will then prevent this validator
+        // from resetting to the parent of `optimistically_confirmed_slot` to create an alternative fork because
         // 1) Validator can't vote on earlier ancestor of last vote due to switch threshold (can't vote
         // on ancestors of last vote)
         // 2) Won't reset to this earlier ancestor because reset can only happen on same voted fork if
         // it's for the last vote slot or later
         remove_tower(&exited_validator_info.info.ledger_path, &node_to_restart);
-        blockstore.set_dead_slot(prev_voted_slot).unwrap();
-    }
+        blockstore
+            .set_dead_slot(optimistically_confirmed_slot)
+            .unwrap();
+        blockstore
+            .meta(optimistically_confirmed_slot)
+            .unwrap()
+            .unwrap()
+            .parent_slot
+            .unwrap()
+    };
 
     {
         // Buffer stderr to detect optimistic slot violation log
         let buf = std::env::var("OPTIMISTIC_CONF_TEST_DUMP_LOG")
             .err()
             .map(|_| BufferRedirect::stderr().unwrap());
+
+        // In order to prevent the node from voting on a slot it's already voted on
+        // which can potentially cause a panic in gossip, start up the validator as a
+        // non voter and wait for it to make a new block
+        exited_validator_info.config.voting_disabled = true;
         cluster.restart_node(
             &node_to_restart,
             exited_validator_info,
             SocketAddrSpace::Unspecified,
         );
 
-        // Wait for a root > prev_voted_slot to be set. Because the root is on a
-        // different fork than `prev_voted_slot`, then optimistic confirmation is
-        // violated
-        let client = cluster.get_validator_client(&node_to_restart).unwrap();
+        // Wait for this node to make a fork that doesn't include the `optimistically_confirmed_slot``
+        info!(
+            "Looking for slot not equal to {optimistically_confirmed_slot}
+            with parent {optimistically_confirmed_slot_parent}"
+        );
+        let start = Instant::now();
+        let new_fork_slot;
+        'outer: loop {
+            sleep(Duration::from_millis(1000));
+            let ledger_path = cluster.ledger_path(&node_to_restart);
+            let blockstore = open_blockstore(&ledger_path);
+            let potential_new_forks = blockstore
+                .meta(optimistically_confirmed_slot_parent)
+                .unwrap()
+                .unwrap()
+                .next_slots;
+            for slot in potential_new_forks {
+                // Wait for a fork to be created that does not include the OC slot
+
+                // Now on restart the validator should only vote for this new`slot` which they have
+                // never voted on before and thus avoids the panic in gossip
+                if slot > optimistically_confirmed_slot && blockstore.is_full(slot) {
+                    new_fork_slot = slot;
+                    break 'outer;
+                }
+            }
+            if start.elapsed() > Duration::from_secs(max_wait_time_seconds) {
+                cluster.exit();
+                panic!("Didn't get new fork within {max_wait_time_seconds} seconds");
+            }
+        }
+
+        // Exit again, restart with voting enabled
+        let mut exited_validator_info = cluster.exit_node(&node_to_restart);
+        exited_validator_info.config.voting_disabled = false;
+        cluster.restart_node(
+            &node_to_restart,
+            exited_validator_info,
+            SocketAddrSpace::Unspecified,
+        );
+
+        // Wait for a root descended from `new_fork_slot` to be set.
+        let client = cluster
+            .build_validator_tpu_quic_client(&node_to_restart)
+            .unwrap();
+
+        info!("looking for root > {optimistically_confirmed_slot} on new fork {new_fork_slot}");
+        let start = Instant::now();
         loop {
+            info!("Client connecting to: {}", client.rpc_client().url());
             let last_root = client
                 .rpc_client()
                 .get_slot_with_commitment(CommitmentConfig::finalized())
                 .unwrap();
-            if last_root > prev_voted_slot {
-                break;
+
+            if last_root > new_fork_slot {
+                info!("Found root: {last_root} > {new_fork_slot}");
+                let ledger_path = cluster.ledger_path(&node_to_restart);
+                let blockstore = open_blockstore(&ledger_path);
+                if AncestorIterator::new_inclusive(last_root, &blockstore).contains(&new_fork_slot)
+                {
+                    break;
+                }
+            }
+            if start.elapsed() > Duration::from_secs(max_wait_time_seconds) {
+                cluster.exit();
+                panic!("Didn't get root on new fork within {max_wait_time_seconds} seconds");
             }
             sleep(Duration::from_millis(100));
         }
 
         // Check to see that validator detected optimistic confirmation for
-        // `prev_voted_slot` failed
+        // `last_voted_slot` failed
         let expected_log =
             OptimisticConfirmationVerifier::format_optimistic_confirmed_slot_violation_log(
-                prev_voted_slot,
+                optimistically_confirmed_slot,
             );
         // Violation detection thread can be behind so poll logs up to 10 seconds
         if let Some(mut buf) = buf {
@@ -1797,7 +1895,9 @@ fn test_validator_saves_tower() {
     };
     let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
 
-    let validator_client = cluster.get_validator_client(&validator_id).unwrap();
+    let validator_client = cluster
+        .build_validator_tpu_quic_client(&validator_id)
+        .unwrap();
 
     let ledger_path = cluster
         .validators
@@ -1832,7 +1932,9 @@ fn test_validator_saves_tower() {
 
     // Restart the validator and wait for a new root
     cluster.restart_node(&validator_id, validator_info, SocketAddrSpace::Unspecified);
-    let validator_client = cluster.get_validator_client(&validator_id).unwrap();
+    let validator_client = cluster
+        .build_validator_tpu_quic_client(&validator_id)
+        .unwrap();
 
     // Wait for the first new root
     let last_replayed_root = loop {
@@ -1861,7 +1963,9 @@ fn test_validator_saves_tower() {
         .unwrap();
 
     cluster.restart_node(&validator_id, validator_info, SocketAddrSpace::Unspecified);
-    let validator_client = cluster.get_validator_client(&validator_id).unwrap();
+    let validator_client = cluster
+        .build_validator_tpu_quic_client(&validator_id)
+        .unwrap();
 
     // Wait for a new root, demonstrating the validator was able to make progress from the older `tower1`
     let new_root = loop {
@@ -1894,7 +1998,9 @@ fn test_validator_saves_tower() {
     validator_info.config.require_tower = false;
 
     cluster.restart_node(&validator_id, validator_info, SocketAddrSpace::Unspecified);
-    let validator_client = cluster.get_validator_client(&validator_id).unwrap();
+    let validator_client = cluster
+        .build_validator_tpu_quic_client(&validator_id)
+        .unwrap();
 
     // Wait for another new root
     let new_root = loop {
@@ -2241,7 +2347,6 @@ fn create_snapshot_to_hard_fork(
         None,
         None,
         None,
-        None,
         Arc::default(),
     )
     .unwrap();
@@ -2552,11 +2657,11 @@ fn run_test_load_program_accounts_partition(scan_commitment: CommitmentConfig) {
 
     let on_partition_start = |cluster: &mut LocalCluster, _: &mut ()| {
         let update_client = cluster
-            .get_validator_client(cluster.entry_point_info.pubkey())
+            .build_validator_tpu_quic_client(cluster.entry_point_info.pubkey())
             .unwrap();
         update_client_sender.send(update_client).unwrap();
         let scan_client = cluster
-            .get_validator_client(cluster.entry_point_info.pubkey())
+            .build_validator_tpu_quic_client(cluster.entry_point_info.pubkey())
             .unwrap();
         scan_client_sender.send(scan_client).unwrap();
     };
@@ -2709,7 +2814,9 @@ fn test_oc_bad_signatures() {
     );
 
     // 3) Start up a spy to listen for and push votes to leader TPU
-    let client = cluster.build_tpu_quic_client().unwrap();
+    let client = cluster
+        .build_validator_tpu_quic_client(cluster.entry_point_info.pubkey())
+        .unwrap();
     let cluster_funding_keypair = cluster.funding_keypair.insecure_clone();
     let voter_thread_sleep_ms: usize = 100;
     let num_votes_simulated = Arc::new(AtomicUsize::new(0));
@@ -3079,10 +3186,12 @@ fn run_test_load_program_accounts(scan_commitment: CommitmentConfig) {
         .find(|x| x != cluster.entry_point_info.pubkey())
         .unwrap();
     let client = cluster
-        .get_validator_client(cluster.entry_point_info.pubkey())
+        .build_validator_tpu_quic_client(cluster.entry_point_info.pubkey())
         .unwrap();
     update_client_sender.send(client).unwrap();
-    let scan_client = cluster.get_validator_client(&other_validator_id).unwrap();
+    let scan_client = cluster
+        .build_validator_tpu_quic_client(&other_validator_id)
+        .unwrap();
     scan_client_sender.send(scan_client).unwrap();
 
     // Wait for some roots to pass
@@ -3859,7 +3968,6 @@ fn test_kill_partition_switch_threshold_progress() {
 
 #[test]
 #[serial]
-#[ignore]
 #[allow(unused_attributes)]
 fn test_duplicate_shreds_broadcast_leader() {
     run_duplicate_shreds_broadcast_leader(true);
@@ -3891,7 +3999,13 @@ fn run_duplicate_shreds_broadcast_leader(vote_on_duplicate: bool) {
 
     // Critical that bad_leader_stake + good_node_stake < DUPLICATE_THRESHOLD and that
     // bad_leader_stake + good_node_stake + our_node_stake > DUPLICATE_THRESHOLD so that
-    // our vote is the determining factor
+    // our vote is the determining factor.
+    //
+    // Also critical that bad_leader_stake > 1 - DUPLICATE_THRESHOLD, so that the leader
+    // doesn't try and dump his own block, which will happen if:
+    // 1. A version is duplicate confirmed
+    // 2. The version they played/stored into blockstore isn't the one that is duplicated
+    // confirmed.
     let bad_leader_stake = 10_000_000 * DEFAULT_NODE_STAKE;
     // Ensure that the good_node_stake is always on the critical path, and the partition node
     // should never be on the critical path. This way, none of the bad shreds sent to the partition
@@ -3919,6 +4033,7 @@ fn run_duplicate_shreds_broadcast_leader(vote_on_duplicate: bool) {
         (bad_leader_stake + good_node_stake + our_node_stake) as f64 / total_stake as f64
             > DUPLICATE_THRESHOLD
     );
+    assert!((bad_leader_stake as f64 / total_stake as f64) >= 1.0 - DUPLICATE_THRESHOLD);
 
     // Important that the partition node stake is the smallest so that it gets selected
     // for the partition.

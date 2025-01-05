@@ -265,7 +265,7 @@ impl ClusterInfoVoteListener {
             if !votes.is_empty() {
                 let (vote_txs, packets) = Self::verify_votes(votes, root_bank_cache);
                 verified_vote_transactions_sender.send(vote_txs)?;
-                verified_packets_sender.send(BankingPacketBatch::new((packets, None)))?;
+                verified_packets_sender.send(BankingPacketBatch::new(packets))?;
             }
             sleep(Duration::from_millis(GOSSIP_SLEEP_MILLIS));
         }
@@ -789,7 +789,7 @@ mod tests {
         } = setup();
 
         // Check outdated slots are purged with new root
-        let new_voter = solana_sdk::pubkey::new_rand();
+        let new_voter = solana_pubkey::new_rand();
         // Make separate copy so the original doesn't count toward
         // the ref count, which would prevent cleanup
         let new_voter_ = new_voter;

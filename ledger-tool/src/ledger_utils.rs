@@ -9,7 +9,6 @@ use {
     },
     solana_core::{
         accounts_hash_verifier::AccountsHashVerifier,
-        rewards_recorder_service::RewardsRecorderService,
         snapshot_packager_service::PendingSnapshotPackages, validator::BlockVerificationMethod,
     },
     solana_geyser_plugin_manager::geyser_plugin_service::{
@@ -18,16 +17,17 @@ use {
     solana_ledger::{
         bank_forks_utils::{self, BankForksUtilsError},
         blockstore::{Blockstore, BlockstoreError},
-        blockstore_options::{
-            AccessType, BlockstoreOptions, BlockstoreRecoveryMode, LedgerColumnOptions,
-        },
+        blockstore_options::{AccessType, BlockstoreOptions, BlockstoreRecoveryMode},
         blockstore_processor::{
             self, BlockstoreProcessorError, ProcessOptions, TransactionStatusSender,
         },
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
     solana_measure::measure_time,
-    solana_rpc::transaction_status_service::TransactionStatusService,
+    solana_rpc::{
+        cache_block_meta_service::CacheBlockMetaService,
+        transaction_status_service::TransactionStatusService,
+    },
     solana_runtime::{
         accounts_background_service::{
             AbsRequestHandlers, AbsRequestSender, AccountsBackgroundService,
@@ -290,8 +290,8 @@ pub fn load_and_process_ledger(
     let (
         transaction_status_sender,
         transaction_status_service,
-        rewards_recorder_sender,
-        rewards_recorder_service,
+        cache_block_meta_sender,
+        cache_block_meta_service,
     ) = if geyser_plugin_active || enable_rpc_transaction_history {
         // Need Primary (R/W) access to insert transaction and rewards data;
         // obtain Primary access if we do not already have it
@@ -317,11 +317,13 @@ pub fn load_and_process_ledger(
             exit.clone(),
         );
 
-        let (rewards_recorder_sender, rewards_recorder_receiver) = unbounded();
-        let rewards_recorder_service = RewardsRecorderService::new(
-            rewards_recorder_receiver,
-            Arc::default(),
+        let (cache_block_meta_sender, cache_block_meta_receiver) = unbounded();
+        // Nothing else will be interacting with max_complete_rewards_slot
+        let max_complete_rewards_slot = Arc::default();
+        let cache_block_meta_service = CacheBlockMetaService::new(
+            cache_block_meta_receiver,
             write_blockstore,
+            max_complete_rewards_slot,
             exit.clone(),
         );
 
@@ -330,8 +332,8 @@ pub fn load_and_process_ledger(
                 sender: transaction_status_sender,
             }),
             Some(transaction_status_service),
-            Some(rewards_recorder_sender.into()),
-            Some(rewards_recorder_service),
+            Some(cache_block_meta_sender),
+            Some(cache_block_meta_service),
         )
     } else {
         (transaction_status_sender, None, None, None)
@@ -344,7 +346,7 @@ pub fn load_and_process_ledger(
             account_paths,
             snapshot_config.as_ref(),
             &process_options,
-            None,
+            cache_block_meta_sender.as_ref(),
             None, // Maybe support this later, though
             accounts_update_notifier,
             exit.clone(),
@@ -427,8 +429,7 @@ pub fn load_and_process_ledger(
         &leader_schedule_cache,
         &process_options,
         transaction_status_sender.as_ref(),
-        None, // cache_block_meta_sender
-        rewards_recorder_sender.as_ref(),
+        cache_block_meta_sender.as_ref(),
         None, // entry_notification_sender
         &accounts_background_request_sender,
     )
@@ -444,7 +445,7 @@ pub fn load_and_process_ledger(
     if let Some(service) = transaction_status_service {
         service.join().unwrap();
     }
-    if let Some(service) = rewards_recorder_service {
+    if let Some(service) = cache_block_meta_service {
         service.join().unwrap();
     }
 
@@ -468,7 +469,7 @@ pub fn open_blockstore(
             access_type: access_type.clone(),
             recovery_mode: wal_recovery_mode.clone(),
             enforce_ulimit_nofile,
-            column_options: LedgerColumnOptions::default(),
+            ..BlockstoreOptions::default()
         },
     ) {
         Ok(blockstore) => blockstore,

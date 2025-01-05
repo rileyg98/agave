@@ -1,6 +1,5 @@
 use {
     crate::{broadcast_stage::BroadcastStage, retransmit_stage::RetransmitStage},
-    itertools::Itertools,
     lazy_lru::LruCache,
     rand::{seq::SliceRandom, Rng, SeedableRng},
     rand_chacha::ChaChaRng,
@@ -27,8 +26,8 @@ use {
     solana_streamer::socket::SocketAddrSpace,
     std::{
         any::TypeId,
-        cmp::Reverse,
-        collections::HashMap,
+        cmp::Ordering,
+        collections::{HashMap, HashSet},
         iter::repeat_with,
         marker::PhantomData,
         net::{IpAddr, SocketAddr},
@@ -50,6 +49,7 @@ pub enum Error {
     Loopback { leader: Pubkey, shred: ShredId },
 }
 
+#[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum NodeId {
     // TVU node obtained through gossip (staked or not).
@@ -83,20 +83,12 @@ pub struct ClusterNodesCache<T> {
     ttl: Duration, // Time to live.
 }
 
-pub struct RetransmitPeers<'a> {
-    root_distance: usize, // distance from the root node
-    children: Vec<&'a Node>,
-    // Maps tvu addresses to the first node
-    // in the shuffle with the same address.
-    addrs: HashMap<SocketAddr, Pubkey>, // tvu addresses
-}
-
 impl Node {
     #[inline]
-    fn pubkey(&self) -> Pubkey {
+    fn pubkey(&self) -> &Pubkey {
         match &self.node {
-            NodeId::Pubkey(pubkey) => *pubkey,
-            NodeId::ContactInfo(node) => *node.pubkey(),
+            NodeId::Pubkey(pubkey) => pubkey,
+            NodeId::ContactInfo(node) => node.pubkey(),
         }
     }
 
@@ -168,33 +160,13 @@ impl ClusterNodes<BroadcastStage> {
 }
 
 impl ClusterNodes<RetransmitStage> {
-    pub(crate) fn get_retransmit_addrs(
+    pub fn get_retransmit_addrs(
         &self,
         slot_leader: &Pubkey,
         shred: &ShredId,
         fanout: usize,
+        socket_addr_space: &SocketAddrSpace,
     ) -> Result<(/*root_distance:*/ usize, Vec<SocketAddr>), Error> {
-        let RetransmitPeers {
-            root_distance,
-            children,
-            addrs,
-        } = self.get_retransmit_peers(slot_leader, shred, fanout)?;
-        let protocol = get_broadcast_protocol(shred);
-        let peers = children.into_iter().filter_map(|node| {
-            node.contact_info()?
-                .tvu(protocol)
-                .ok()
-                .filter(|addr| addrs.get(addr) == Some(&node.pubkey()))
-        });
-        Ok((root_distance, peers.collect()))
-    }
-
-    pub fn get_retransmit_peers(
-        &self,
-        slot_leader: &Pubkey,
-        shred: &ShredId,
-        fanout: usize,
-    ) -> Result<RetransmitPeers, Error> {
         let mut weighted_shuffle = self.weighted_shuffle.clone();
         // Exclude slot leader from list of nodes.
         if slot_leader == &self.pubkey {
@@ -206,39 +178,30 @@ impl ClusterNodes<RetransmitStage> {
         if let Some(index) = self.index.get(slot_leader) {
             weighted_shuffle.remove_index(*index);
         }
-        let mut addrs = HashMap::<SocketAddr, Pubkey>::with_capacity(self.nodes.len());
         let mut rng = get_seeded_rng(slot_leader, shred);
-        let protocol = get_broadcast_protocol(shred);
-        let nodes: Vec<_> = weighted_shuffle
-            .shuffle(&mut rng)
-            .map(|index| &self.nodes[index])
-            .inspect(|node| {
-                if let Some(node) = node.contact_info() {
-                    if let Ok(addr) = node.tvu(protocol) {
-                        addrs.entry(addr).or_insert(*node.pubkey());
-                    }
-                }
+        let nodes = {
+            let protocol = get_broadcast_protocol(shred);
+            // If there are 2 nodes in the shuffle with the same socket-addr,
+            // we only send shreds to the first one. The hash-set below allows
+            // to track if a socket-addr was observed earlier in the shuffle.
+            let mut addrs = HashSet::<SocketAddr>::with_capacity(self.nodes.len());
+            weighted_shuffle.shuffle(&mut rng).map(move |index| {
+                let node = &self.nodes[index];
+                let addr: Option<SocketAddr> = node
+                    .contact_info()
+                    .and_then(|node| node.tvu(protocol).ok())
+                    .filter(|&addr| addrs.insert(addr));
+                (node, addr)
             })
-            .collect();
-        let self_index = nodes
-            .iter()
-            .position(|node| node.pubkey() == self.pubkey)
-            .unwrap();
-        let root_distance = if self_index == 0 {
-            0
-        } else if self_index <= fanout {
-            1
-        } else if self_index <= fanout.saturating_add(1).saturating_mul(fanout) {
-            2
-        } else {
-            3 // If changed, update MAX_NUM_TURBINE_HOPS.
         };
-        let peers = get_retransmit_peers(fanout, self_index, &nodes);
-        Ok(RetransmitPeers {
-            root_distance,
-            children: peers.collect(),
-            addrs,
-        })
+        let (index, peers) =
+            get_retransmit_peers(fanout, |(node, _)| node.pubkey() == &self.pubkey, nodes);
+        let peers = peers
+            .filter_map(|(_, addr)| addr)
+            .filter(|addr| socket_addr_space.check(addr))
+            .collect();
+        let root_distance = get_root_distance(index, fanout);
+        Ok((root_distance, peers))
     }
 
     // Returns the parent node in the turbine broadcast tree.
@@ -271,10 +234,10 @@ impl ClusterNodes<RetransmitStage> {
         let nodes: Vec<_> = weighted_shuffle
             .shuffle(&mut rng)
             .map(|index| &self.nodes[index])
-            .take_while(|node| node.pubkey() != self.pubkey)
+            .take_while(|node| node.pubkey() != &self.pubkey)
             .collect();
         let parent = get_retransmit_parent(fanout, nodes.len(), &nodes);
-        Ok(parent.map(Node::pubkey))
+        Ok(parent.map(Node::pubkey).copied())
     }
 }
 
@@ -288,7 +251,7 @@ pub fn new_cluster_nodes<T: 'static>(
     let index: HashMap<_, _> = nodes
         .iter()
         .enumerate()
-        .map(|(ix, node)| (node.pubkey(), ix))
+        .map(|(ix, node)| (*node.pubkey(), ix))
         .collect();
     let broadcast = TypeId::of::<T>() == TypeId::of::<BroadcastStage>();
     let stakes: Vec<u64> = nodes.iter().map(|node| node.stake).collect();
@@ -322,8 +285,8 @@ fn get_nodes(
         let capacity = if should_dedup_addrs { stakes.len() } else { 0 };
         HashMap::<IpAddr, usize>::with_capacity(capacity)
     };
-    // The local node itself.
-    std::iter::once({
+    let mut nodes: Vec<Node> = std::iter::once({
+        // The local node itself.
         let stake = stakes.get(&self_pubkey).copied().unwrap_or_default();
         let node = NodeId::from(cluster_info.my_contact_info());
         Node { node, stake }
@@ -344,11 +307,9 @@ fn get_nodes(
                 stake,
             }),
     )
-    .sorted_by_key(|node| Reverse((node.stake, node.pubkey())))
-    // Since sorted_by_key is stable, in case of duplicates, this
-    // will keep nodes with contact-info.
-    .dedup_by(|a, b| a.pubkey() == b.pubkey())
-    .filter_map(|node| {
+    .collect();
+    sort_and_dedup_nodes(&mut nodes);
+    nodes.retain_mut(|node| {
         if !should_dedup_addrs
             || node
                 .contact_info()
@@ -361,18 +322,45 @@ fn get_nodes(
                 })
                 <= Some(MAX_NUM_NODES_PER_IP_ADDRESS)
         {
-            Some(node)
-        } else {
-            // If the node is not staked, drop it entirely. Otherwise, keep the
-            // pubkey for deterministic shuffle, but strip the contact-info so
-            // that no more packets are sent to this node.
-            (node.stake > 0u64).then(|| Node {
-                node: NodeId::from(node.pubkey()),
+            true
+        } else if node.stake > 0u64 {
+            // Staked node: keep the pubkey for deterministic shuffle, but
+            // strip the contact-info so that no more packets are sent to this
+            // IP address.
+            *node = Node {
+                node: NodeId::from(*node.pubkey()),
                 stake: node.stake,
-            })
+            };
+            true
+        } else {
+            false // Non-staked node: drop it entirely.
         }
-    })
-    .collect()
+    });
+    nodes
+}
+
+// Sorts nodes by highest stakes first and dedups by pubkey.
+fn sort_and_dedup_nodes(nodes: &mut Vec<Node>) {
+    nodes.sort_unstable_by(|a, b| cmp_nodes_stake(b, a));
+    // dedup_by keeps the first of consecutive elements which compare equal.
+    // Because if all else are equal above sort puts NodeId::ContactInfo before
+    // NodeId::Pubkey, this will keep nodes with contact-info.
+    nodes.dedup_by(|a, b| a.pubkey() == b.pubkey());
+}
+
+// Compares nodes by stake and tie breaks by pubkeys.
+// For the same pubkey, NodeId::ContactInfo is considered > NodeId::Pubkey.
+#[inline]
+fn cmp_nodes_stake(a: &Node, b: &Node) -> Ordering {
+    a.stake
+        .cmp(&b.stake)
+        .then_with(|| a.pubkey().cmp(b.pubkey()))
+        .then_with(|| match (&a.node, &b.node) {
+            (NodeId::ContactInfo(_), NodeId::ContactInfo(_)) => Ordering::Equal,
+            (NodeId::ContactInfo(_), NodeId::Pubkey(_)) => Ordering::Greater,
+            (NodeId::Pubkey(_), NodeId::ContactInfo(_)) => Ordering::Less,
+            (NodeId::Pubkey(_), NodeId::Pubkey(_)) => Ordering::Equal,
+        })
 }
 
 fn get_seeded_rng(leader: &Pubkey, shred: &ShredId) -> ChaChaRng {
@@ -393,22 +381,29 @@ fn get_seeded_rng(leader: &Pubkey, shred: &ShredId) -> ChaChaRng {
 // Each other node retransmits shreds to fanout many nodes in the next layer.
 // For example the node k in the 1st layer will retransmit to nodes:
 // fanout + k, 2*fanout + k, ..., fanout*fanout + k
-fn get_retransmit_peers<T: Copy>(
+fn get_retransmit_peers<T>(
     fanout: usize,
-    index: usize, // Local node's index within the nodes slice.
-    nodes: &[T],
-) -> impl Iterator<Item = T> + '_ {
+    // Predicate fn which identifies this node in the shuffle.
+    pred: impl Fn(T) -> bool,
+    nodes: impl IntoIterator<Item = T>,
+) -> (/*this node's index:*/ usize, impl Iterator<Item = T>) {
+    let mut nodes = nodes.into_iter();
+    // This node's index within shuffled nodes.
+    let index = nodes.by_ref().position(pred).unwrap();
     // Node's index within its neighborhood.
     let offset = index.saturating_sub(1) % fanout;
     // First node in the neighborhood.
     let anchor = index - offset;
     let step = if index == 0 { 1 } else { fanout };
-    (anchor * fanout + offset + 1..)
+    let peers = (anchor * fanout + offset + 1..)
         .step_by(step)
         .take(fanout)
-        .map(|i| nodes.get(i))
-        .while_some()
-        .copied()
+        .scan(index, move |state, k| -> Option<T> {
+            let peer = nodes.by_ref().nth(k - *state - 1)?;
+            *state = k;
+            Some(peer)
+        });
+    (index, peers)
 }
 
 // Returns the parent node in the turbine broadcast tree.
@@ -519,6 +514,19 @@ pub(crate) fn get_broadcast_protocol(_: &ShredId) -> Protocol {
     Protocol::UDP
 }
 
+#[inline]
+fn get_root_distance(index: usize, fanout: usize) -> usize {
+    if index == 0 {
+        0
+    } else if index <= fanout {
+        1
+    } else if index <= fanout.saturating_add(1).saturating_mul(fanout) {
+        2
+    } else {
+        3 // If changed, update MAX_NUM_TURBINE_HOPS.
+    }
+}
+
 pub fn make_test_cluster<R: Rng>(
     rng: &mut R,
     num_nodes: usize,
@@ -626,6 +634,7 @@ pub fn check_feature_activation(feature: &Pubkey, shred_slot: Slot, root_bank: &
 mod tests {
     use {
         super::*,
+        itertools::Itertools,
         std::{fmt::Debug, hash::Hash},
         test_case::test_case,
     };
@@ -710,7 +719,7 @@ mod tests {
         T: Copy + Eq + PartialEq + Debug + Hash,
     {
         // Map node identities to their index within the shuffled tree.
-        let index: HashMap<_, _> = nodes
+        let cache: HashMap<_, _> = nodes
             .iter()
             .copied()
             .enumerate()
@@ -720,18 +729,22 @@ mod tests {
         // Root node's parent is None.
         assert_eq!(get_retransmit_parent(fanout, /*index:*/ 0, nodes), None);
         for (k, peers) in peers.into_iter().enumerate() {
-            assert_eq!(
-                get_retransmit_peers(fanout, k, nodes).collect::<Vec<_>>(),
-                peers
-            );
+            {
+                let (index, retransmit_peers) =
+                    get_retransmit_peers(fanout, |node| node == &nodes[k], nodes);
+                assert_eq!(peers, retransmit_peers.copied().collect::<Vec<_>>());
+                assert_eq!(index, k);
+            }
             let parent = Some(nodes[k]);
             for peer in peers {
-                assert_eq!(get_retransmit_parent(fanout, index[&peer], nodes), parent);
+                assert_eq!(get_retransmit_parent(fanout, cache[&peer], nodes), parent);
             }
         }
         // Remaining nodes have no children.
-        for k in offset..=nodes.len() {
-            assert_eq!(get_retransmit_peers(fanout, k, nodes).next(), None);
+        for k in offset..nodes.len() {
+            let (index, mut peers) = get_retransmit_peers(fanout, |node| node == &nodes[k], nodes);
+            assert_eq!(peers.next(), None);
+            assert_eq!(index, k);
         }
     }
 
@@ -860,7 +873,7 @@ mod tests {
         let mut nodes: Vec<_> = (0..size).collect();
         nodes.shuffle(&mut rng);
         // Map node identities to their index within the shuffled tree.
-        let index: HashMap<_, _> = nodes
+        let cache: HashMap<_, _> = nodes
             .iter()
             .copied()
             .enumerate()
@@ -870,14 +883,68 @@ mod tests {
         assert_eq!(get_retransmit_parent(fanout, /*index:*/ 0, &nodes), None);
         for k in 1..size {
             let parent = get_retransmit_parent(fanout, k, &nodes).unwrap();
-            let mut peers = get_retransmit_peers(fanout, index[&parent], &nodes);
-            assert_eq!(peers.find(|&peer| peer == nodes[k]), Some(nodes[k]));
+            let (index, mut peers) = get_retransmit_peers(fanout, |node| node == &parent, &nodes);
+            assert_eq!(index, cache[&parent]);
+            assert_eq!(peers.find(|&&peer| peer == nodes[k]), Some(&nodes[k]));
         }
         for k in 0..size {
             let parent = Some(nodes[k]);
-            for peer in get_retransmit_peers(fanout, k, &nodes) {
-                assert_eq!(get_retransmit_parent(fanout, index[&peer], &nodes), parent);
+            let (index, peers) = get_retransmit_peers(fanout, |node| node == &nodes[k], &nodes);
+            assert_eq!(index, k);
+            for peer in peers {
+                assert_eq!(get_retransmit_parent(fanout, cache[peer], &nodes), parent);
             }
         }
+    }
+
+    #[test]
+    fn test_sort_and_dedup_nodes() {
+        let mut rng = rand::thread_rng();
+        let pubkeys: Vec<Pubkey> = std::iter::repeat_with(|| Pubkey::from(rng.gen::<[u8; 32]>()))
+            .take(50)
+            .collect();
+        let stakes = std::iter::repeat_with(|| rng.gen_range(0..100u64));
+        let stakes: HashMap<Pubkey, u64> = pubkeys.iter().copied().zip(stakes).collect();
+        let mut nodes: Vec<Node> = std::iter::repeat_with(|| {
+            let pubkey = pubkeys.choose(&mut rng).copied().unwrap();
+            let stake = stakes[&pubkey];
+            let node = ContactInfo::new_localhost(&pubkey, /*wallclock:*/ timestamp());
+            [
+                Node {
+                    node: NodeId::from(node),
+                    stake,
+                },
+                Node {
+                    node: NodeId::from(pubkey),
+                    stake,
+                },
+            ]
+        })
+        .flatten()
+        .take(10_000)
+        .collect();
+        let mut unique_pubkeys: HashSet<Pubkey> = nodes.iter().map(Node::pubkey).copied().collect();
+        nodes.shuffle(&mut rng);
+        sort_and_dedup_nodes(&mut nodes);
+        // Assert that stakes are non-decreasing.
+        for (a, b) in nodes.iter().tuple_windows() {
+            assert!(a.stake >= b.stake);
+        }
+        // Assert that larger pubkey tie-breaks equal stakes.
+        for (a, b) in nodes.iter().tuple_windows() {
+            if a.stake == b.stake {
+                assert!(a.pubkey() > b.pubkey());
+            }
+        }
+        // Assert that NodeId::Pubkey are dropped in favor of
+        // NodeId::ContactInfo.
+        for node in &nodes {
+            assert_matches!(node.node, NodeId::ContactInfo(_));
+        }
+        // Assert that unique pubkeys are preserved.
+        for node in &nodes {
+            assert!(unique_pubkeys.remove(node.pubkey()))
+        }
+        assert!(unique_pubkeys.is_empty());
     }
 }

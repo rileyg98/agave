@@ -24,10 +24,7 @@ use {
         transaction_batch::TransactionBatch,
         verify_precompiles::verify_precompiles,
     },
-    solana_runtime_transaction::{
-        instructions_processor::process_compute_budget_instructions,
-        transaction_with_meta::TransactionWithMeta,
-    },
+    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     solana_sdk::{
         clock::{FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET, MAX_PROCESSING_AGE},
         fee::FeeBudgetLimits,
@@ -41,9 +38,9 @@ use {
         transaction_processing_result::TransactionProcessingResultExtensions,
         transaction_processor::{ExecutionRecordingConfig, TransactionProcessingConfig},
     },
-    solana_svm_transaction::svm_message::SVMMessage,
     solana_timings::ExecuteTimings,
     std::{
+        num::Saturating,
         sync::{atomic::Ordering, Arc},
         time::Instant,
     },
@@ -754,16 +751,17 @@ impl Consumer {
 
     pub fn check_fee_payer_unlocked(
         bank: &Bank,
-        message: &impl SVMMessage,
+        transaction: &impl TransactionWithMeta,
         error_counters: &mut TransactionErrorMetrics,
     ) -> Result<(), TransactionError> {
-        let fee_payer = message.fee_payer();
-        let fee_budget_limits = FeeBudgetLimits::from(process_compute_budget_instructions(
-            message.program_instructions_iter(),
-            &bank.feature_set,
-        )?);
+        let fee_payer = transaction.fee_payer();
+        let fee_budget_limits = FeeBudgetLimits::from(
+            transaction
+                .compute_budget_instruction_details()
+                .sanitize_and_convert_to_compute_budget_limits(&bank.feature_set)?,
+        );
         let fee = solana_fee::calculate_fee(
-            message,
+            transaction,
             bank.get_lamports_per_signature() == 0,
             bank.fee_structure().lamports_per_signature,
             fee_budget_limits.prioritization_fee,
@@ -792,10 +790,11 @@ impl Consumer {
             (0, 0),
             |(units, times), program_timings| {
                 (
-                    units
-                        .saturating_add(program_timings.accumulated_units)
-                        .saturating_add(program_timings.total_errored_units),
-                    times.saturating_add(program_timings.accumulated_us),
+                    (Saturating(units)
+                        + program_timings.accumulated_units
+                        + program_timings.total_errored_units)
+                        .0,
+                    (Saturating(times) + program_timings.accumulated_us).0,
                 )
             },
         )
@@ -1039,9 +1038,9 @@ mod tests {
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
         // Set up unparallelizable conflicting transactions
-        let pubkey0 = solana_sdk::pubkey::new_rand();
-        let pubkey1 = solana_sdk::pubkey::new_rand();
-        let pubkey2 = solana_sdk::pubkey::new_rand();
+        let pubkey0 = solana_pubkey::new_rand();
+        let pubkey1 = solana_pubkey::new_rand();
+        let pubkey2 = solana_pubkey::new_rand();
         let transactions = vec![
             system_transaction::transfer(mint_keypair, &pubkey0, 1, genesis_config.hash()),
             system_transaction::transfer(mint_keypair, &pubkey1, 1, genesis_config.hash()),
@@ -1081,7 +1080,7 @@ mod tests {
             ..
         } = create_slow_genesis_config(10_000);
         let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
 
         let transactions = sanitize_transactions(vec![system_transaction::transfer(
             &mint_keypair,
@@ -1374,7 +1373,7 @@ mod tests {
             ..
         } = create_slow_genesis_config(10_000);
         let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
 
         let transactions = {
             let mut tx =
@@ -1461,7 +1460,7 @@ mod tests {
         let mut bank = Bank::new_for_tests(&genesis_config);
         bank.ns_per_slot = u128::MAX;
         let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
 
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         {
@@ -1617,8 +1616,8 @@ mod tests {
             ..
         } = create_slow_genesis_config(10_000);
         let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
-        let pubkey = solana_sdk::pubkey::new_rand();
-        let pubkey1 = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
+        let pubkey1 = solana_pubkey::new_rand();
 
         let transactions = sanitize_transactions(vec![
             system_transaction::transfer(&mint_keypair, &pubkey, 1, genesis_config.hash()),
@@ -1824,7 +1823,7 @@ mod tests {
         } = create_slow_genesis_config(10_000);
         let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
 
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
 
         let transactions = sanitize_transactions(vec![system_transaction::transfer(
             &mint_keypair,
@@ -1906,8 +1905,8 @@ mod tests {
         genesis_config.rent.lamports_per_byte_year = 50;
         genesis_config.rent.exemption_threshold = 2.0;
         let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
-        let pubkey = solana_sdk::pubkey::new_rand();
-        let pubkey1 = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
+        let pubkey1 = solana_pubkey::new_rand();
         let keypair1 = Keypair::new();
 
         let rent_exempt_amount = bank.get_minimum_balance_for_rent_exemption(0);
@@ -2522,11 +2521,11 @@ mod tests {
             execute_timings.details.per_program_timings.insert(
                 Pubkey::new_unique(),
                 ProgramTiming {
-                    accumulated_us: n * 100,
-                    accumulated_units: n * 1000,
-                    count: n as u32,
+                    accumulated_us: Saturating(n * 100),
+                    accumulated_units: Saturating(n * 1000),
+                    count: Saturating(n as u32),
                     errored_txs_compute_consumed: vec![],
-                    total_errored_units: 0,
+                    total_errored_units: Saturating(0),
                 },
             );
             expected_us += n * 100;

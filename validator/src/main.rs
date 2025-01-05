@@ -23,8 +23,10 @@ use {
             AccountIndex, AccountSecondaryIndexes, AccountSecondaryIndexesIncludeExclude,
             AccountsIndexConfig, IndexLimitMb, ScanFilter,
         },
-        partitioned_rewards::TestPartitionedEpochRewards,
-        utils::{create_all_accounts_run_and_snapshot_dirs, create_and_canonicalize_directories},
+        utils::{
+            create_all_accounts_run_and_snapshot_dirs, create_and_canonicalize_directories,
+            create_and_canonicalize_directory,
+        },
     },
     solana_clap_utils::input_parsers::{keypair_of, keypairs_of, pubkey_of, value_of, values_of},
     solana_core::{
@@ -34,7 +36,7 @@ use {
         tpu::DEFAULT_TPU_COALESCE,
         validator::{
             is_snapshot_config_valid, BlockProductionMethod, BlockVerificationMethod, Validator,
-            ValidatorConfig, ValidatorError, ValidatorStartProgress,
+            ValidatorConfig, ValidatorError, ValidatorStartProgress, ValidatorTpuConfig,
         },
     },
     solana_gossip::{
@@ -904,6 +906,8 @@ pub fn main() {
         rayon_global_threads,
         replay_forks_threads,
         replay_transactions_threads,
+        rocksdb_compaction_threads,
+        rocksdb_flush_threads,
         tvu_receive_threads,
         tvu_sigverify_threads,
     } = cli::thread_args::parse_num_threads_args(&matches);
@@ -1052,6 +1056,8 @@ pub fn main() {
         enforce_ulimit_nofile: true,
         // The validator needs primary (read/write)
         access_type: AccessType::Primary,
+        num_rocksdb_compaction_threads: rocksdb_compaction_threads,
+        num_rocksdb_flush_threads: rocksdb_flush_threads,
     };
 
     let accounts_hash_cache_path = matches
@@ -1124,6 +1130,8 @@ pub fn main() {
     let accounts_shrink_optimize_total_space =
         value_t_or_exit!(matches, "accounts_shrink_optimize_total_space", bool);
     let tpu_use_quic = !matches.is_present("tpu_disable_quic");
+    let vote_use_quic = value_t_or_exit!(matches, "vote_use_quic", bool);
+
     let tpu_enable_udp = if matches.is_present("tpu_enable_udp") {
         true
     } else {
@@ -1223,15 +1231,6 @@ pub fn main() {
     if let Ok(bins) = value_t!(matches, "accounts_index_bins", usize) {
         accounts_index_config.bins = Some(bins);
     }
-
-    let test_partitioned_epoch_rewards =
-        if matches.is_present("partitioned_epoch_rewards_compare_calculation") {
-            TestPartitionedEpochRewards::CompareResults
-        } else if matches.is_present("partitioned_epoch_rewards_force_enable_single_slot") {
-            TestPartitionedEpochRewards::ForcePartitionedEpochRewardsInOneBlock
-        } else {
-            TestPartitionedEpochRewards::None
-        };
 
     accounts_index_config.index_limit_mb = if matches.is_present("disable_accounts_disk_index") {
         IndexLimitMb::InMemOnly
@@ -1357,7 +1356,6 @@ pub fn main() {
         .ok(),
         exhaustively_verify_refcounts: matches.is_present("accounts_db_verify_refcounts"),
         create_ancient_storage,
-        test_partitioned_epoch_rewards,
         test_skip_rewrites_but_include_in_bank_hash: matches
             .is_present("accounts_db_test_skip_rewrites"),
         storage_access,
@@ -1366,6 +1364,8 @@ pub fn main() {
             .is_present("accounts_db_experimental_accumulator_hash"),
         verify_experimental_accumulator_hash: matches
             .is_present("accounts_db_verify_experimental_accumulator_hash"),
+        snapshots_use_experimental_accumulator_hash: matches
+            .is_present("accounts_db_snapshots_use_experimental_accumulator_hash"),
         num_clean_threads: Some(accounts_db_clean_threads),
         num_foreground_threads: Some(accounts_db_foreground_threads),
         num_hash_threads: Some(accounts_db_hash_threads),
@@ -1487,6 +1487,7 @@ pub fn main() {
             ),
             disable_health_check: false,
             rpc_threads: value_t_or_exit!(matches, "rpc_threads", usize),
+            rpc_blocking_threads: value_t_or_exit!(matches, "rpc_blocking_threads", usize),
             rpc_niceness_adj: value_t_or_exit!(matches, "rpc_niceness_adj", i8),
             account_indexes: account_indexes.clone(),
             rpc_scan_and_fix_roots: matches.is_present("rpc_scan_and_fix_roots"),
@@ -1671,13 +1672,14 @@ pub fn main() {
     } else {
         &ledger_path
     };
-    let snapshots_dir = fs::canonicalize(snapshots_dir).unwrap_or_else(|err| {
+    let snapshots_dir = create_and_canonicalize_directory(snapshots_dir).unwrap_or_else(|err| {
         eprintln!(
-            "Failed to canonicalize snapshots path '{}': {err}",
+            "Failed to create snapshots directory '{}': {err}",
             snapshots_dir.display(),
         );
         exit(1);
     });
+
     if account_paths
         .iter()
         .any(|account_path| account_path == &snapshots_dir)
@@ -2077,10 +2079,13 @@ pub fn main() {
         rpc_to_plugin_manager_receiver,
         start_progress,
         socket_addr_space,
-        tpu_use_quic,
-        tpu_connection_pool_size,
-        tpu_enable_udp,
-        tpu_max_connections_per_ipaddr_per_minute,
+        ValidatorTpuConfig {
+            use_quic: tpu_use_quic,
+            vote_use_quic,
+            tpu_connection_pool_size,
+            tpu_enable_udp,
+            tpu_max_connections_per_ipaddr_per_minute,
+        },
         admin_service_post_init,
     ) {
         Ok(validator) => validator,

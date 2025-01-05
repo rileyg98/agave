@@ -11,7 +11,7 @@ use {
     solana_client::connection_cache::ConnectionCache,
     solana_core::{
         consensus::tower_storage::FileTowerStorage,
-        validator::{Validator, ValidatorConfig, ValidatorStartProgress},
+        validator::{Validator, ValidatorConfig, ValidatorStartProgress, ValidatorTpuConfig},
     },
     solana_gossip::{
         cluster_info::Node,
@@ -51,7 +51,7 @@ use {
     solana_streamer::{socket::SocketAddrSpace, streamer::StakedNodes},
     solana_tpu_client::tpu_client::{
         TpuClient, TpuClientConfig, DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_TPU_ENABLE_UDP,
-        DEFAULT_TPU_USE_QUIC,
+        DEFAULT_TPU_USE_QUIC, DEFAULT_VOTE_USE_QUIC,
     },
     solana_vote_program::{
         vote_instruction,
@@ -61,7 +61,7 @@ use {
         collections::HashMap,
         io::{Error, ErrorKind, Result},
         iter,
-        net::{IpAddr, Ipv4Addr},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         sync::{Arc, RwLock},
         time::Instant,
@@ -97,6 +97,7 @@ pub struct ClusterConfig {
     pub additional_accounts: Vec<(Pubkey, AccountSharedData)>,
     pub tpu_use_quic: bool,
     pub tpu_connection_pool_size: usize,
+    pub vote_use_quic: bool,
 }
 
 impl ClusterConfig {
@@ -136,6 +137,7 @@ impl Default for ClusterConfig {
             additional_accounts: vec![],
             tpu_use_quic: DEFAULT_TPU_USE_QUIC,
             tpu_connection_pool_size: DEFAULT_TPU_CONNECTION_POOL_SIZE,
+            vote_use_quic: DEFAULT_VOTE_USE_QUIC,
         }
     }
 }
@@ -339,12 +341,15 @@ impl LocalCluster {
             None, // rpc_to_plugin_manager_receiver
             Arc::new(RwLock::new(ValidatorStartProgress::default())),
             socket_addr_space,
-            DEFAULT_TPU_USE_QUIC,
-            DEFAULT_TPU_CONNECTION_POOL_SIZE,
-            // We are turning tpu_enable_udp to true in order to prevent concurrent local cluster tests
-            // to use the same QUIC ports due to SO_REUSEPORT.
-            true,
-            32, // max connections per IpAddr per minute
+            ValidatorTpuConfig {
+                use_quic: DEFAULT_TPU_USE_QUIC,
+                vote_use_quic: DEFAULT_VOTE_USE_QUIC,
+                tpu_connection_pool_size: DEFAULT_TPU_CONNECTION_POOL_SIZE,
+                // We are turning tpu_enable_udp to true in order to prevent concurrent local cluster tests
+                // to use the same QUIC ports due to SO_REUSEPORT.
+                tpu_enable_udp: true,
+                tpu_max_connections_per_ipaddr_per_minute: 32, // max connections per IpAddr per minute
+            },
             Arc::new(RwLock::new(None)),
         )
         .expect("assume successful validator start");
@@ -488,7 +493,9 @@ impl LocalCluster {
         mut voting_keypair: Option<Arc<Keypair>>,
         socket_addr_space: SocketAddrSpace,
     ) -> Pubkey {
-        let client = self.build_tpu_quic_client().expect("tpu_client");
+        let client = self
+            .build_validator_tpu_quic_client(self.entry_point_info.pubkey())
+            .expect("tpu_client");
 
         // Must have enough tokens to fund vote account and set delegate
         let should_create_vote_pubkey = voting_keypair.is_none();
@@ -546,10 +553,13 @@ impl LocalCluster {
             None, // rpc_to_plugin_manager_receiver
             Arc::new(RwLock::new(ValidatorStartProgress::default())),
             socket_addr_space,
-            DEFAULT_TPU_USE_QUIC,
-            DEFAULT_TPU_CONNECTION_POOL_SIZE,
-            DEFAULT_TPU_ENABLE_UDP,
-            32, // max connections per IpAddr per mintute
+            ValidatorTpuConfig {
+                use_quic: DEFAULT_TPU_USE_QUIC,
+                vote_use_quic: DEFAULT_VOTE_USE_QUIC,
+                tpu_connection_pool_size: DEFAULT_TPU_CONNECTION_POOL_SIZE,
+                tpu_enable_udp: DEFAULT_TPU_ENABLE_UDP,
+                tpu_max_connections_per_ipaddr_per_minute: 32, // max connections per IpAddr per mintute
+            },
             Arc::new(RwLock::new(None)),
         )
         .expect("assume successful validator start");
@@ -584,7 +594,9 @@ impl LocalCluster {
     }
 
     pub fn transfer(&self, source_keypair: &Keypair, dest_pubkey: &Pubkey, lamports: u64) -> u64 {
-        let client = self.build_tpu_quic_client().expect("new tpu quic client");
+        let client = self
+            .build_validator_tpu_quic_client(self.entry_point_info.pubkey())
+            .expect("new tpu quic client");
         Self::transfer_with_client(&client, source_keypair, dest_pubkey, lamports)
     }
 
@@ -933,12 +945,12 @@ impl LocalCluster {
         }
     }
 
-    fn build_tpu_client<F>(&self, rpc_client_builder: F) -> Result<QuicTpuClient>
-    where
-        F: FnOnce(String) -> Arc<RpcClient>,
-    {
-        let rpc_pubsub_url = format!("ws://{}/", self.entry_point_info.rpc_pubsub().unwrap());
-        let rpc_url = format!("http://{}", self.entry_point_info.rpc().unwrap());
+    fn build_tpu_client(
+        &self,
+        rpc_client: Arc<RpcClient>,
+        rpc_pubsub_addr: SocketAddr,
+    ) -> Result<QuicTpuClient> {
+        let rpc_pubsub_url = format!("ws://{}/", rpc_pubsub_addr);
 
         let cache = match &*self.connection_cache {
             ConnectionCache::Quic(cache) => cache,
@@ -951,7 +963,7 @@ impl LocalCluster {
         };
 
         let tpu_client = TpuClient::new_with_connection_cache(
-            rpc_client_builder(rpc_url),
+            rpc_client,
             rpc_pubsub_url.as_str(),
             TpuClientConfig::default(),
             cache.clone(),
@@ -967,24 +979,22 @@ impl Cluster for LocalCluster {
         self.validators.keys().cloned().collect()
     }
 
-    fn get_validator_client(&self, pubkey: &Pubkey) -> Option<QuicTpuClient> {
-        self.validators.get(pubkey).map(|_| {
-            self.build_tpu_quic_client()
-                .expect("should build tpu quic client")
-        })
+    fn build_validator_tpu_quic_client(&self, pubkey: &Pubkey) -> Result<QuicTpuClient> {
+        let contact_info = self.get_contact_info(pubkey).unwrap();
+        let rpc_url: String = format!("http://{}", contact_info.rpc().unwrap());
+        let rpc_client = Arc::new(RpcClient::new(rpc_url));
+        self.build_tpu_client(rpc_client, contact_info.rpc_pubsub().unwrap())
     }
 
-    fn build_tpu_quic_client(&self) -> Result<QuicTpuClient> {
-        self.build_tpu_client(|rpc_url| Arc::new(RpcClient::new(rpc_url)))
-    }
-
-    fn build_tpu_quic_client_with_commitment(
+    fn build_validator_tpu_quic_client_with_commitment(
         &self,
+        pubkey: &Pubkey,
         commitment_config: CommitmentConfig,
     ) -> Result<QuicTpuClient> {
-        self.build_tpu_client(|rpc_url| {
-            Arc::new(RpcClient::new_with_commitment(rpc_url, commitment_config))
-        })
+        let contact_info = self.get_contact_info(pubkey).unwrap();
+        let rpc_url = format!("http://{}", contact_info.rpc().unwrap());
+        let rpc_client = Arc::new(RpcClient::new_with_commitment(rpc_url, commitment_config));
+        self.build_tpu_client(rpc_client, contact_info.rpc_pubsub().unwrap())
     }
 
     fn exit_node(&mut self, pubkey: &Pubkey) -> ClusterValidatorInfo {
@@ -1079,10 +1089,13 @@ impl Cluster for LocalCluster {
             None, // rpc_to_plugin_manager_receiver
             Arc::new(RwLock::new(ValidatorStartProgress::default())),
             socket_addr_space,
-            DEFAULT_TPU_USE_QUIC,
-            DEFAULT_TPU_CONNECTION_POOL_SIZE,
-            DEFAULT_TPU_ENABLE_UDP,
-            32, // max connections per IpAddr per minute, use higher value because of tests
+            ValidatorTpuConfig {
+                use_quic: DEFAULT_TPU_USE_QUIC,
+                vote_use_quic: DEFAULT_VOTE_USE_QUIC,
+                tpu_connection_pool_size: DEFAULT_TPU_CONNECTION_POOL_SIZE,
+                tpu_enable_udp: DEFAULT_TPU_ENABLE_UDP,
+                tpu_max_connections_per_ipaddr_per_minute: 32, // max connections per IpAddr per minute, use higher value because of tests
+            },
             Arc::new(RwLock::new(None)),
         )
         .expect("assume successful validator start");

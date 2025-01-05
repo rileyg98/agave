@@ -48,7 +48,7 @@ use {
         self, MAX_BATCH_SEND_RATE_MS, MAX_TRANSACTION_BATCH_SIZE,
     },
     solana_streamer::quic::DEFAULT_QUIC_ENDPOINTS,
-    solana_tpu_client::tpu_client::DEFAULT_TPU_CONNECTION_POOL_SIZE,
+    solana_tpu_client::tpu_client::{DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC},
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     std::{path::PathBuf, str::FromStr},
 };
@@ -899,6 +899,14 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .help("Controls the rate of the clients connections per IpAddr per minute."),
         )
         .arg(
+            Arg::with_name("vote_use_quic")
+                .long("vote-use-quic")
+                .takes_value(true)
+                .default_value(&default_args.vote_use_quic)
+                .hidden(hidden_unless_forced())
+                .help("Controls if to use QUIC to send votes."),
+        )
+        .arg(
             Arg::with_name("num_quic_endpoints")
                 .long("num-quic-endpoints")
                 .takes_value(true)
@@ -950,6 +958,27 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .takes_value(true)
                 .default_value(&default_args.rpc_threads)
                 .help("Number of threads to use for servicing RPC requests"),
+        )
+        .arg(
+            Arg::with_name("rpc_blocking_threads")
+                .long("rpc-blocking-threads")
+                .value_name("NUMBER")
+                .validator(is_parsable::<usize>)
+                .validator(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|err| format!("error parsing '{value}': {err}"))
+                        .and_then(|threads| {
+                            if threads > 0 {
+                                Ok(())
+                            } else {
+                                Err("value must be >= 1".to_string())
+                            }
+                        })
+                })
+                .takes_value(true)
+                .default_value(&default_args.rpc_blocking_threads)
+                .help("Number of blocking threads to use for servicing CPU bound RPC requests (eg getMultipleAccounts)"),
         )
         .arg(
             Arg::with_name("rpc_niceness_adj")
@@ -1427,6 +1456,12 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .hidden(hidden_unless_forced()),
         )
         .arg(
+            Arg::with_name("accounts_db_snapshots_use_experimental_accumulator_hash")
+                .long("accounts-db-snapshots-use-experimental-accumulator-hash")
+                .help("Snapshots use the experimental accumulator hash")
+                .hidden(hidden_unless_forced()),
+        )
+        .arg(
             Arg::with_name("accounts_index_scan_results_limit_mb")
                 .long("accounts-index-scan-results-limit-mb")
                 .value_name("MEGABYTES")
@@ -1444,29 +1479,6 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .validator(is_pow2)
                 .takes_value(true)
                 .help("Number of bins to divide the accounts index into"),
-        )
-        .arg(
-            Arg::with_name("partitioned_epoch_rewards_compare_calculation")
-                .long("partitioned-epoch-rewards-compare-calculation")
-                .takes_value(false)
-                .help(
-                    "Do normal epoch rewards distribution, but also calculate rewards using the \
-                     partitioned rewards code path and compare the resulting vote and stake \
-                     accounts",
-                )
-                .hidden(hidden_unless_forced()),
-        )
-        .arg(
-            Arg::with_name("partitioned_epoch_rewards_force_enable_single_slot")
-                .long("partitioned-epoch-rewards-force-enable-single-slot")
-                .takes_value(false)
-                .help(
-                    "Force the partitioned rewards distribution, but distribute all rewards in \
-                     the first slot in the epoch. This should match consensus with the normal \
-                     rewards distribution.",
-                )
-                .conflicts_with("partitioned_epoch_rewards_compare_calculation")
-                .hidden(hidden_unless_forced()),
         )
         .arg(
             Arg::with_name("accounts_index_path")
@@ -2262,6 +2274,7 @@ pub struct DefaultArgs {
     pub rpc_send_transaction_batch_size: String,
     pub rpc_send_transaction_retry_pool_max_size: String,
     pub rpc_threads: String,
+    pub rpc_blocking_threads: String,
     pub rpc_niceness_adjustment: String,
     pub rpc_bigtable_timeout: String,
     pub rpc_bigtable_instance_name: String,
@@ -2294,6 +2307,7 @@ pub struct DefaultArgs {
     pub tpu_connection_pool_size: String,
     pub tpu_max_connections_per_ipaddr_per_minute: String,
     pub num_quic_endpoints: String,
+    pub vote_use_quic: String,
 
     // Exit subcommand
     pub exit_min_idle_time: String,
@@ -2353,6 +2367,7 @@ impl DefaultArgs {
                 .retry_pool_max_size
                 .to_string(),
             rpc_threads: num_cpus::get().to_string(),
+            rpc_blocking_threads: 1.max(num_cpus::get() / 4).to_string(),
             rpc_niceness_adjustment: "0".to_string(),
             rpc_bigtable_timeout: "30".to_string(),
             rpc_bigtable_instance_name: solana_storage_bigtable::DEFAULT_INSTANCE_NAME.to_string(),
@@ -2385,6 +2400,7 @@ impl DefaultArgs {
             tpu_connection_pool_size: DEFAULT_TPU_CONNECTION_POOL_SIZE.to_string(),
             tpu_max_connections_per_ipaddr_per_minute:
                 DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE.to_string(),
+            vote_use_quic: DEFAULT_VOTE_USE_QUIC.to_string(),
             num_quic_endpoints: DEFAULT_QUIC_ENDPOINTS.to_string(),
             rpc_max_request_body_size: MAX_REQUEST_BODY_SIZE.to_string(),
             exit_min_idle_time: "10".to_string(),
