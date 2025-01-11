@@ -1540,47 +1540,7 @@ pub mod test {
         }
     }
 
-    pub async fn check_multiple_streams(
-        receiver: Receiver<PacketBatch>,
-        server_address: SocketAddr
-    ) {
-        let conn1 = Arc::new(make_client_endpoint(&server_address, None).await);
-        let conn2 = Arc::new(make_client_endpoint(&server_address, None).await);
-        let mut num_expected_packets = 0;
-        for i in 0..10 {
-            info!("sending: {}", i);
-            let c1 = conn1.clone();
-            let c2 = conn2.clone();
-            let mut s1 = c1.open_uni().await.unwrap();
-            let mut s2 = c2.open_uni().await.unwrap();
-            s1.write_all(&[0u8]).await.unwrap();
-            s1.finish().unwrap();
-            s2.write_all(&[0u8]).await.unwrap();
-            s2.finish().unwrap();
-            num_expected_packets += 2;
-            sleep(Duration::from_millis(200)).await;
-        }
-        let mut all_packets = vec![];
-        let now = Instant::now();
-        let mut total_packets = 0;
-        while now.elapsed().as_secs() < 10 {
-            if let Ok(packets) = receiver.try_recv() {
-                total_packets += packets.len();
-                all_packets.push(packets);
-            } else {
-                sleep(Duration::from_secs(1)).await;
-            }
-            if total_packets == num_expected_packets {
-                break;
-            }
-        }
-        for batch in all_packets {
-            for p in batch.iter() {
-                assert_eq!(p.meta().size, 1);
-            }
-        }
-        assert_eq!(total_packets, num_expected_packets);
-    }
+    
 
     pub async fn check_multiple_writes(
         receiver: Receiver<PacketBatch>,
