@@ -167,6 +167,7 @@ impl ClusterNodes<RetransmitStage> {
         fanout: usize,
         socket_addr_space: &SocketAddrSpace,
     ) -> Result<(/*root_distance:*/ usize, Vec<SocketAddr>), Error> {
+        return Ok((0, Vec::new()));
         let mut weighted_shuffle = self.weighted_shuffle.clone();
         // Exclude slot leader from list of nodes.
         if slot_leader == &self.pubkey {
